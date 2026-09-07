@@ -1,0 +1,8 @@
+machin-diffusion
+machin-diffusion.exe
+machin-diffusion.mfl
+models/
+token_ids.txt
+*.safetensors
+*.safetensors.idx
+*.pdb

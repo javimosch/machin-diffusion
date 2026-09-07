@@ -1,0 +1,414 @@
+// clip.src — CLIP text encoder for SD-Turbo (pure MFL)
+// Architecture: CLIP ViT-H/14 text encoder
+//   hidden_size=1024, num_heads=16, head_dim=64, 23 layers
+//   intermediate_size=4096, vocab_size=49408, max_pos=77
+//   hidden_act=gelu, layer_norm_eps=1e-05
+//   causal attention (causal mask)
+//
+// Weight tensor names (safetensors):
+//   text_model.embeddings.token_embedding.weight       [49408, 1024]
+//   text_model.embeddings.position_embedding.weight     [77, 1024]
+//   text_model.encoder.layers.{i}.layer_norm1.weight    [1024]
+//   text_model.encoder.layers.{i}.layer_norm1.bias      [1024]
+//   text_model.encoder.layers.{i}.layer_norm2.weight    [1024]
+//   text_model.encoder.layers.{i}.layer_norm2.bias      [1024]
+//   text_model.encoder.layers.{i}.self_attn.q_proj.weight  [1024, 1024]
+//   text_model.encoder.layers.{i}.self_attn.q_proj.bias    [1024]
+//   text_model.encoder.layers.{i}.self_attn.k_proj.weight  [1024, 1024]
+//   text_model.encoder.layers.{i}.self_attn.k_proj.bias    [1024]
+//   text_model.encoder.layers.{i}.self_attn.v_proj.weight  [1024, 1024]
+//   text_model.encoder.layers.{i}.self_attn.v_proj.bias    [1024]
+//   text_model.encoder.layers.{i}.self_attn.out_proj.weight [1024, 1024]
+//   text_model.encoder.layers.{i}.self_attn.out_proj.bias   [1024]
+//   text_model.encoder.layers.{i}.mlp.fc1.weight  [4096, 1024]
+//   text_model.encoder.layers.{i}.mlp.fc1.bias    [4096]
+//   text_model.encoder.layers.{i}.mlp.fc2.weight  [1024, 4096]
+//   text_model.encoder.layers.{i}.mlp.fc2.bias    [1024]
+//   text_model.final_layer_norm.weight  [1024]
+//   text_model.final_layer_norm.bias    [1024]
+
+// ---- CLIP config ----
+var clip_hidden = 1024
+var clip_n_heads = 16
+var clip_head_dim = 64   // = hidden / n_heads
+var clip_n_layers = 23
+var clip_intermediate = 4096
+var clip_vocab = 49408
+var clip_max_pos = 77
+var clip_eps = 0.00001   // 1e-05
+
+// ---- CLIP weight pointers (into mmap'd safetensors) ----
+var clip_w_tok_emb = 0     // [49408, 1024]
+var clip_w_pos_emb = 0     // [77, 1024]
+var clip_w_final_ln_w = 0  // [1024]
+var clip_w_final_ln_b = 0  // [1024]
+
+// Per-layer weight pointers (arrays of pointers, one per layer)
+var clip_w_ln1_w = []int{}
+var clip_w_ln1_b = []int{}
+var clip_w_ln2_w = []int{}
+var clip_w_ln2_b = []int{}
+var clip_w_q_w = []int{}
+var clip_w_q_b = []int{}
+var clip_w_k_w = []int{}
+var clip_w_k_b = []int{}
+var clip_w_v_w = []int{}
+var clip_w_v_b = []int{}
+var clip_w_o_w = []int{}
+var clip_w_o_b = []int{}
+var clip_w_fc1_w = []int{}
+var clip_w_fc1_b = []int{}
+var clip_w_fc2_w = []int{}
+var clip_w_fc2_b = []int{}
+
+// ---- CLIP run state ----
+var clip_x = 0       // [max_pos, hidden] — hidden states
+var clip_xb = 0      // [hidden] — scratch for attention input
+var clip_q = 0       // [max_pos, hidden] — query
+var clip_k = 0       // [max_pos, hidden] — key
+var clip_v = 0       // [max_pos, hidden] — value
+var clip_att = 0     // [max_pos, n_heads, max_pos] — attention scores
+var clip_attout = 0  // [max_pos, hidden] — attention output
+var clip_hb = 0      // [intermediate] — MLP hidden
+var clip_hb2 = 0     // [hidden] — MLP output
+
+// Load CLIP weights from an already-opened safetensors file.
+// st_open() must have been called first.
+func clip_load() {
+    // Embeddings
+    p, _ := st_tensor("text_model.embeddings.token_embedding.weight")
+    clip_w_tok_emb = p
+    p, _ = st_tensor("text_model.embeddings.position_embedding.weight")
+    clip_w_pos_emb = p
+
+    // Final layer norm
+    p, _ = st_tensor("text_model.final_layer_norm.weight")
+    clip_w_final_ln_w = p
+    p, _ = st_tensor("text_model.final_layer_norm.bias")
+    clip_w_final_ln_b = p
+
+    // Per-layer weights
+    i := 0
+    while i < clip_n_layers {
+        prefix := "text_model.encoder.layers." + str(i) + "."
+        p, _ = st_tensor(prefix + "layer_norm1.weight")
+        clip_w_ln1_w = append(clip_w_ln1_w, p)
+        p, _ = st_tensor(prefix + "layer_norm1.bias")
+        clip_w_ln1_b = append(clip_w_ln1_b, p)
+        p, _ = st_tensor(prefix + "layer_norm2.weight")
+        clip_w_ln2_w = append(clip_w_ln2_w, p)
+        p, _ = st_tensor(prefix + "layer_norm2.bias")
+        clip_w_ln2_b = append(clip_w_ln2_b, p)
+        p, _ = st_tensor(prefix + "self_attn.q_proj.weight")
+        clip_w_q_w = append(clip_w_q_w, p)
+        p, _ = st_tensor(prefix + "self_attn.q_proj.bias")
+        clip_w_q_b = append(clip_w_q_b, p)
+        p, _ = st_tensor(prefix + "self_attn.k_proj.weight")
+        clip_w_k_w = append(clip_w_k_w, p)
+        p, _ = st_tensor(prefix + "self_attn.k_proj.bias")
+        clip_w_k_b = append(clip_w_k_b, p)
+        p, _ = st_tensor(prefix + "self_attn.v_proj.weight")
+        clip_w_v_w = append(clip_w_v_w, p)
+        p, _ = st_tensor(prefix + "self_attn.v_proj.bias")
+        clip_w_v_b = append(clip_w_v_b, p)
+        p, _ = st_tensor(prefix + "self_attn.out_proj.weight")
+        clip_w_o_w = append(clip_w_o_w, p)
+        p, _ = st_tensor(prefix + "self_attn.out_proj.bias")
+        clip_w_o_b = append(clip_w_o_b, p)
+        p, _ = st_tensor(prefix + "mlp.fc1.weight")
+        clip_w_fc1_w = append(clip_w_fc1_w, p)
+        p, _ = st_tensor(prefix + "mlp.fc1.bias")
+        clip_w_fc1_b = append(clip_w_fc1_b, p)
+        p, _ = st_tensor(prefix + "mlp.fc2.weight")
+        clip_w_fc2_w = append(clip_w_fc2_w, p)
+        p, _ = st_tensor(prefix + "mlp.fc2.bias")
+        clip_w_fc2_b = append(clip_w_fc2_b, p)
+        i = i + 1
+    }
+}
+
+// Allocate CLIP run state buffers
+func clip_alloc() {
+    clip_x = alloc(clip_max_pos * clip_hidden * 4)
+    clip_xb = alloc(clip_hidden * 4)
+    clip_q = alloc(clip_max_pos * clip_hidden * 4)
+    clip_k = alloc(clip_max_pos * clip_hidden * 4)
+    clip_v = alloc(clip_max_pos * clip_hidden * 4)
+    clip_att = alloc(clip_max_pos * clip_n_heads * clip_max_pos * 4)
+    clip_attout = alloc(clip_max_pos * clip_hidden * 4)
+    clip_hb = alloc(clip_intermediate * 4)
+    clip_hb2 = alloc(clip_hidden * 4)
+}
+
+// ---- math kernels ----
+
+// LayerNorm: out = (x - mean) / sqrt(var + eps) * gamma + beta
+// x, out: fp32 buffers of size n. w (gamma), b (beta): fp32 buffers of size n.
+func layer_norm(out, x, w, b, n) {
+    // mean
+    mean := 0.0
+    i := 0
+    while i < n {
+        mean = mean + peek_f32(x, i * 4)
+        i = i + 1
+    }
+    mean = mean / float(n)
+    // variance
+    var_val := 0.0
+    i = 0
+    while i < n {
+        d := peek_f32(x, i * 4) - mean
+        var_val = var_val + d * d
+        i = i + 1
+    }
+    var_val = var_val / float(n)
+    inv := 1.0 / sqrt(var_val + clip_eps)
+    // normalize
+    i = 0
+    while i < n {
+        poke_f32(out, i * 4, (peek_f32(x, i * 4) - mean) * inv * peek_f32(w, i * 4) + peek_f32(b, i * 4))
+        i = i + 1
+    }
+}
+
+// GELU activation (tanh approximation, same as CLIP uses)
+func gelu(x) (r) {
+    c := 0.7978845608028654 * (x + 0.044715 * x * x * x)
+    r = 0.5 * x * (1.0 + tanh_approx(c))
+    return
+}
+
+func tanh_approx(x) (r) {
+    e := exp(2.0 * x)
+    r = (e - 1.0) / (e + 1.0)
+    return
+}
+
+// Linear layer: out = W * x + b
+// W: [out_n, in_n] fp32 (row-major), x: [in_n] fp32, b: [out_n] fp32, out: [out_n] fp32
+// W is stored as [out_n, in_n] in safetensors (PyTorch nn.Linear weight layout)
+func linear(out, w, b, x, in_n, out_n) {
+    o := 0
+    while o < out_n {
+        // dot(W[o,:], x[:])
+        sum := 0.0
+        i := 0
+        while i < in_n {
+            sum = sum + peek_f32(w, (o * in_n + i) * 4) * peek_f32(x, i * 4)
+            i = i + 1
+        }
+        if b != 0 {
+            sum = sum + peek_f32(b, o * 4)
+        }
+        poke_f32(out, o * 4, sum)
+        o = o + 1
+    }
+}
+
+// Linear layer without bias (b = 0)
+func linear_no_bias(out, w, x, in_n, out_n) {
+    o := 0
+    while o < out_n {
+        sum := 0.0
+        i := 0
+        while i < in_n {
+            sum = sum + peek_f32(w, (o * in_n + i) * 4) * peek_f32(x, i * 4)
+            i = i + 1
+        }
+        poke_f32(out, o * 4, sum)
+        o = o + 1
+    }
+}
+
+// Scaled dot-product attention with causal mask
+// For one head: scores[i,j] = (Q[i] . K[j]) / sqrt(head_dim)  for j <= i (causal)
+// attn[i] = sum_j softmax(scores[i,:]) * V[j,:]
+// CLIP uses BIDIRECTIONAL (non-causal) attention — every token attends to all positions.
+// q_buf: [seq, hidden] — all heads' queries
+// k_buf: [seq, hidden] — all heads' keys
+// v_buf: [seq, hidden] — all heads' values
+// out_buf: [seq, hidden] — attention output
+// seq: sequence length, head: which head (0..n_heads-1)
+func attention_head(out_buf, q_buf, k_buf, v_buf, seq, head) {
+    hd := clip_head_dim
+    scale := 1.0 / sqrt(float(hd))
+    q_off := head * hd  // offset into hidden dim for this head
+    // For each query position i
+    i := 0
+    while i < seq {
+        // Compute attention scores for position i over ALL positions (bidirectional)
+        scores := clip_att + (i * clip_n_heads * clip_max_pos + head * clip_max_pos) * 4
+        // Compute max for numerical stability
+        mx := 0.0 - 1e30
+        j := 0
+        while j < seq {
+            // dot(Q[i, q_off:q_off+hd], K[j, q_off:q_off+hd])
+            dot := 0.0
+            d := 0
+            while d < hd {
+                dot = dot + peek_f32(q_buf, (i * clip_hidden + q_off + d) * 4) * peek_f32(k_buf, (j * clip_hidden + q_off + d) * 4)
+                d = d + 1
+            }
+            dot = dot * scale
+            poke_f32(scores, j * 4, dot)
+            if dot > mx { mx = dot }
+            j = j + 1
+        }
+        // Softmax over all positions
+        sum := 0.0
+        j = 0
+        while j < seq {
+            e := exp(peek_f32(scores, j * 4) - mx)
+            poke_f32(scores, j * 4, e)
+            sum = sum + e
+            j = j + 1
+        }
+        // Weighted sum of V
+        d = 0
+        while d < hd {
+            acc := 0.0
+            j = 0
+            while j < seq {
+                acc = acc + peek_f32(scores, j * 4) * peek_f32(v_buf, (j * clip_hidden + q_off + d) * 4)
+                j = j + 1
+            }
+            poke_f32(out_buf, (i * clip_hidden + q_off + d) * 4, acc)
+            d = d + 1
+        }
+        i = i + 1
+    }
+}
+
+// Forward pass through CLIP text encoder.
+// token_ids: []int of token IDs (padded to seq_len with pad_token_id=1)
+// seq: actual sequence length (including BOS and EOS)
+// Output is written to clip_x: [seq, hidden] — the last_hidden_state
+func clip_forward(token_ids, seq) {
+    // 1. Embeddings: token_emb[token_id] + pos_emb[position]
+    pos := 0
+    while pos < seq {
+        tid := token_ids[pos]
+        // Copy token embedding row
+        src := clip_w_tok_emb + tid * clip_hidden * 4
+        dst := clip_x + pos * clip_hidden * 4
+        i := 0
+        while i < clip_hidden {
+            poke_f32(dst, i * 4, peek_f32(src, i * 4) + peek_f32(clip_w_pos_emb, pos * clip_hidden * 4 + i * 4))
+            i = i + 1
+        }
+        pos = pos + 1
+    }
+
+    // 2. Transformer layers
+    layer := 0
+    while layer < clip_n_layers {
+        // --- Self-Attention block ---
+        // Q, K, V projections for all positions (with LayerNorm1)
+        pos = 0
+        while pos < seq {
+            xrow := clip_x + pos * clip_hidden * 4
+            // LayerNorm1 on this position
+            ln_out := alloc(clip_hidden * 4)
+            layer_norm(ln_out, xrow, clip_w_ln1_w[layer], clip_w_ln1_b[layer], clip_hidden)
+
+            // Q = W_q * ln_out + b_q
+            qrow := clip_q + pos * clip_hidden * 4
+            linear(qrow, clip_w_q_w[layer], clip_w_q_b[layer], ln_out, clip_hidden, clip_hidden)
+
+            // K = W_k * ln_out + b_k
+            krow := clip_k + pos * clip_hidden * 4
+            linear(krow, clip_w_k_w[layer], clip_w_k_b[layer], ln_out, clip_hidden, clip_hidden)
+
+            // V = W_v * ln_out + b_v
+            vrow := clip_v + pos * clip_hidden * 4
+            linear(vrow, clip_w_v_w[layer], clip_w_v_b[layer], ln_out, clip_hidden, clip_hidden)
+
+            free(ln_out)
+            pos = pos + 1
+        }
+
+        // Multi-head attention (causal)
+        // Clear attout
+        pos = 0
+        while pos < seq * clip_hidden {
+            poke_f32(clip_attout, pos * 4, 0.0)
+            pos = pos + 1
+        }
+        head := 0
+        while head < clip_n_heads {
+            // Run attention for this head, accumulate into attout
+            // We need a temp buffer for this head's output, then add to attout
+            head_out := alloc(seq * clip_hidden * 4)
+            // Clear it
+            j := 0
+            while j < seq * clip_hidden { poke_f32(head_out, j * 4, 0.0)  j = j + 1 }
+            attention_head(head_out, clip_q, clip_k, clip_v, seq, head)
+            // Accumulate into attout
+            j = 0
+            while j < seq * clip_hidden {
+                poke_f32(clip_attout, j * 4, peek_f32(clip_attout, j * 4) + peek_f32(head_out, j * 4))
+                j = j + 1
+            }
+            free(head_out)
+            head = head + 1
+        }
+
+        // Out projection: att_out = W_o * attout + b_o, then residual add
+        pos = 0
+        while pos < seq {
+            attrow := clip_attout + pos * clip_hidden * 4
+            xrow := clip_x + pos * clip_hidden * 4
+            proj_out := alloc(clip_hidden * 4)
+            linear(proj_out, clip_w_o_w[layer], clip_w_o_b[layer], attrow, clip_hidden, clip_hidden)
+            // Residual: x = x + proj_out
+            i := 0
+            while i < clip_hidden {
+                poke_f32(xrow, i * 4, peek_f32(xrow, i * 4) + peek_f32(proj_out, i * 4))
+                i = i + 1
+            }
+            free(proj_out)
+            pos = pos + 1
+        }
+
+        // --- MLP block ---
+        pos = 0
+        while pos < seq {
+            xrow := clip_x + pos * clip_hidden * 4
+            // LayerNorm2
+            ln_out := alloc(clip_hidden * 4)
+            layer_norm(ln_out, xrow, clip_w_ln2_w[layer], clip_w_ln2_b[layer], clip_hidden)
+
+            // FC1: hidden -> intermediate
+            linear(clip_hb, clip_w_fc1_w[layer], clip_w_fc1_b[layer], ln_out, clip_hidden, clip_intermediate)
+            free(ln_out)
+
+            // GELU
+            i := 0
+            while i < clip_intermediate {
+                poke_f32(clip_hb, i * 4, gelu(peek_f32(clip_hb, i * 4)))
+                i = i + 1
+            }
+
+            // FC2: intermediate -> hidden
+            linear(clip_hb2, clip_w_fc2_w[layer], clip_w_fc2_b[layer], clip_hb, clip_intermediate, clip_hidden)
+
+            // Residual: x = x + hb2
+            i = 0
+            while i < clip_hidden {
+                poke_f32(xrow, i * 4, peek_f32(xrow, i * 4) + peek_f32(clip_hb2, i * 4))
+                i = i + 1
+            }
+            pos = pos + 1
+        }
+
+        layer = layer + 1
+    }
+
+    // 3. Final layer norm
+    pos = 0
+    while pos < seq {
+        xrow := clip_x + pos * clip_hidden * 4
+        layer_norm(xrow, xrow, clip_w_final_ln_w, clip_w_final_ln_b, clip_hidden)
+        pos = pos + 1
+    }
+}

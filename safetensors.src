@@ -1,0 +1,113 @@
+// safetensors.src — zero-copy safetensors reader for machin-diffusion
+// Mmaps a .safetensors file, reads a pre-extracted .idx sidecar for tensor metadata.
+// The .idx file is produced by scripts/extract_header.py (one-time, ~20KB).
+// The .safetensors file is used as-is — no model conversion.
+
+// ---- safetensors state ----
+var st_buf = 0        // mmap pointer to the safetensors file
+var st_data_base = 0  // byte offset where tensor data starts (= 8 + header_len)
+
+// Tensor index entry (parsed from .idx file)
+type TensorIdx struct {
+    name string
+    start int    // byte offset into the data section
+    end int
+    ndims int
+    dims []int
+}
+
+var st_index = []TensorIdx{}
+var st_index_map = make(map[string]int)  // name -> index into st_index
+
+// Read u64 LE from mmap'd buffer at byte offset
+func read_u64_ptr(p, off) (v) {
+    v = 0
+    i := 0
+    while i < 8 {
+        v = v | (peek_u8(p, off + i) << (i * 8))
+        i = i + 1
+    }
+    return
+}
+
+// Parse a line from the .idx file: name<TAB>start<TAB>end<TAB>ndims<TAB>dim0,dim1,...
+func parse_idx_line(line) (idx, ok) {
+    ok = 0
+    parts := split(line, "\t")
+    if len(parts) < 5 { return }
+    idx.name = parts[0]
+    idx.start = parse_int(parts[1])
+    idx.end = parse_int(parts[2])
+    idx.ndims = parse_int(parts[3])
+    dimParts := split(parts[4], ",")
+    for _, d := range dimParts {
+        idx.dims = append(idx.dims, parse_int(d))
+    }
+    ok = 1
+    return
+}
+
+// Open a safetensors file + its pre-extracted .idx sidecar.
+// Uses mmap on POSIX, falls back to read_file_raw on Windows (mmap stubbed).
+func st_open(path) {
+    // Read the .idx sidecar
+    idxPath := path + ".idx"
+    idxText := read_file(idxPath)
+    if len(idxText) == 0 { println("st_open: cannot read " + idxPath)  exit(1) }
+    lines := split(idxText, "\n")
+    for _, line := range lines {
+        if len(line) == 0 { continue }
+        entry, ok := parse_idx_line(line)
+        if ok == 1 {
+            st_index = append(st_index, entry)
+            st_index_map[entry.name] = len(st_index) - 1
+        }
+    }
+
+    // Try mmap first (POSIX), fall back to full read (Windows)
+    p, n := mmap_file(path)
+    if p != 0 {
+        st_buf = p
+    } else {
+        // Windows fallback: read the entire file into memory
+        // First read the 8-byte header to get header length
+        hdr := alloc(8)
+        read_file_raw(path, hdr, 8)
+        hlen := read_u64_ptr(hdr, 0)
+        free(hdr)
+        totalSize := 8 + hlen
+        // Find total file size from the last tensor's end offset
+        maxEnd := 0
+        for _, entry := range st_index {
+            if entry.end > maxEnd { maxEnd = entry.end }
+        }
+        totalSize = 8 + hlen + maxEnd
+        // Allocate and read the whole file
+        st_buf = alloc(totalSize)
+        got := read_file_raw(path, st_buf, totalSize)
+        if got < 0 { println("st_open: cannot read " + path)  exit(1) }
+    }
+
+    // Read the actual header length to compute data base
+    hlen := read_u64_ptr(st_buf, 0)
+    st_data_base = 8 + hlen
+}
+
+// Get a tensor's raw pointer and element count by name.
+// Returns (ptr, nfloats) — ptr is into the mmap'd file, nfloats = (end-start)/4.
+func st_tensor(name) (ptr, nfloats) {
+    if !has(st_index_map, name) { println("st_tensor: " + name + " not found")  return 0, 0 }
+    idx := st_index_map[name]
+    entry := st_index[idx]
+    ptr = st_buf + st_data_base + entry.start
+    nfloats = (entry.end - entry.start) / 4
+    return
+}
+
+// Get a tensor's shape by name
+func st_shape(name) (dims) {
+    if !has(st_index_map, name) { return []int{} }
+    idx := st_index_map[name]
+    dims = st_index[idx].dims
+    return
+}

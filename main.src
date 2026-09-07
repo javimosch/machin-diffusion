@@ -1,0 +1,72 @@
+// main.src — machin-diffusion entry point
+// Usage: machin-diffusion <model_dir> <token_ids_file>
+// token_ids_file: one integer per line (BOS + tokens + EOS, padded to 77)
+// Use scripts/tokenize.py to generate the token IDs file from a prompt.
+
+// ---- main ----
+
+func main() {
+    argv := args()
+    if len(argv) < 3 {
+        println("usage: machin-diffusion <model_dir> <token_ids_file>")
+        println("  model_dir contains text_encoder/model.safetensors[.idx]")
+        println("  token_ids_file: one int per line (use scripts/tokenize.py)")
+        exit(1)
+    }
+
+    modelDir := argv[1]
+    tokensPath := argv[2]
+
+    println("machin-diffusion — SD-Turbo in pure MFL")
+
+    // 1. Read token IDs
+    tokenText := read_file(tokensPath)
+    if len(tokenText) == 0 { println("cannot read " + tokensPath)  exit(1) }
+    tokenLines := split(tokenText, "\n")
+    token_ids := []int{}
+    for _, line := range tokenLines {
+        if len(line) == 0 { continue }
+        token_ids = append(token_ids, parse_int(line))
+    }
+
+    // Find seq length (up to EOS or end of non-pad tokens)
+    seq := len(token_ids)
+    if seq > clip_max_pos { seq = clip_max_pos }
+    println("tokens: " + str(seq))
+
+    // 2. Load CLIP text encoder weights
+    println("loading text encoder...")
+    // Normalize path separators (Windows passes backslashes, MFL uses forward slashes)
+    modelDir = replace(modelDir, "\\", "/")
+    st_open(modelDir + "/text_encoder/model.safetensors")
+    clip_load()
+    clip_alloc()
+
+    // 3. Run CLIP forward pass
+    println("running CLIP forward pass...")
+    clip_forward(token_ids, seq)
+
+    // 4. Print output stats (for verification)
+    println("CLIP output: " + str(seq) + " x " + str(clip_hidden))
+    // Print first few values of the first token's embedding
+    print("embedding[0][:5]:")
+    i := 0
+    while i < 5 {
+        print(" " + str(peek_f32(clip_x, i * 4)))
+        i = i + 1
+    }
+    println("")
+
+    // Print embedding norm (sanity check — should be nonzero)
+    norm := 0.0
+    i = 0
+    while i < clip_hidden {
+        v := peek_f32(clip_x, i * 4)
+        norm = norm + v * v
+        i = i + 1
+    }
+    println("embedding[0] norm: " + str(sqrt(norm)))
+
+    // TODO: UNet forward pass + VAE decode + image output
+    println("CLIP text encoder complete. UNet + VAE not yet implemented.")
+}

@@ -195,12 +195,14 @@ func tanh_approx(x) (r) {
 // Uses native matmul_f32 (batch=1) for vectorized C speed.
 func linear(out, w, b, x, in_n, out_n) {
     matmul_f32(out, x, w, b, in_n, out_n, 1)
+    ocl_sync()
 }
 
 // Batched linear: out[b, o] = dot(x[b,:], w[o,:]) + bias[o]
 // x: [batch, in_n], w: [out_n, in_n], b: [out_n], out: [batch, out_n]
 func linear_batch(out, w, b, x, in_n, out_n, batch) {
     matmul_f32(out, x, w, b, in_n, out_n, batch)
+    ocl_sync()
 }
 
 // Batched LayerNorm: normalizes each row of [batch, n] independently
@@ -217,6 +219,7 @@ func layer_norm_batch(out, x, w, b, batch, n) {
 // Linear layer without bias (b = 0)
 func linear_no_bias(out, w, x, in_n, out_n) {
     matmul_f32(out, x, w, 0, in_n, out_n, 1)
+    ocl_sync()
 }
 
 // Scaled dot-product attention with causal mask

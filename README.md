@@ -1,7 +1,7 @@
 # machin-diffusion
 
 **Stable Diffusion Turbo inference in pure [machin](https://github.com/javimosch/machin) (MFL).**
-No Python, no PyTorch, no libtorch — one static binary. GPU-accelerated via OpenCL on AMD RX 6600.
+No Python, no PyTorch, no libtorch — one static binary. GPU-accelerated via OpenCL on AMD RX 6600 and NVIDIA RTX 4090.
 
 **Model:** [stabilityai/sd-turbo](https://huggingface.co/stabilityai/sd-turbo) — distilled SD 2.1 for single-step generation.
 
@@ -12,7 +12,7 @@ canonical diffusers/PyTorch reference (pixel diff mean=0.02, max=1 out of 255).
 
 | Component | Status |
 |-----------|--------|
-| Safetensors reader (mmap + Windows fallback) | ✅ |
+| Safetensors reader (mmap on Linux + Windows) | ✅ |
 | CLIP BPE tokenizer (Python pre-processing) | ✅ |
 | CLIP text encoder (23-layer transformer, fp32, quick_gelu) | ✅ |
 | UNet (conv + attention, 1-step diffusion) | ✅ |
@@ -62,17 +62,19 @@ prompt → tokenize.py → token_ids.txt
 ### Weight loading
 
 Safetensors files are used **as-is** — zero conversion. A small `.idx` sidecar (28KB) is
-pre-extracted with `scripts/extract_header.py` for tensor metadata. On POSIX the safetensors
-is mmap'd (zero-copy); on Windows it's read into memory with `read_file_raw`.
+pre-extracted with `scripts/extract_header.py` for tensor metadata. The safetensors is
+mmap'd on both POSIX (mmap) and Windows (CreateFileMappingA + MapViewOfFile) — zero-copy,
+lazy page-mapped.
 
 ### GPU backend
 
-Three hot primitives dispatch to OpenCL on the AMD RX 6600:
+Three hot primitives dispatch to OpenCL on AMD RX 6600 and NVIDIA RTX 4090:
 - `conv2d_f32` — 2D convolution (NCHW)
 - `matmul_f32` — batched fp32 matmul
 - `group_norm_f32` — GroupNorm
 
 The MFL code stays unchanged — the builtin dispatch is automatic when `ocl_init()` succeeds.
+The OpenCL backend dynamically loads `OpenCL.dll` (Windows) or `libOpenCL.so.1` (Linux via dlopen).
 
 ### Scheduler
 
@@ -113,15 +115,47 @@ machin encode safetensors.src clip.src spatial.src unet_blocks.src unet.src vae.
 machin build machin-diffusion.mfl --target windows -o machin-diffusion.exe
 ```
 
+### Build for Linux (GPU target — NVIDIA, AMD, Intel)
+
+```bash
+machin encode safetensors.src clip.src spatial.src unet_blocks.src unet.src vae.src image.src main.src \
+  > machin-diffusion.mfl
+machin build machin-diffusion.mfl -o machin-diffusion
+./machin-diffusion models/sd-turbo token_ids.txt output.ppm
+```
+
+Requires an OpenCL ICD loader installed (`apt install ocl-icd-opencl-dev` on Debian/Ubuntu)
+and the vendor ICD file in `/etc/OpenCL/vendors/` (e.g. `nvidia.icd` containing the path to
+`libnvidia-opencl.so.1`). The binary dynamically loads `libOpenCL.so.1` via `dlopen` at runtime.
+
 ## Performance
 
 | Platform | Time | Notes |
 |----------|------|-------|
 | CPU (Intel i7-2700K, 8 threads) | 30+ min | scalar fp32, no SIMD |
 | GPU (AMD RX 6600, OpenCL) — initial | ~7 min | naive kernels, CPU attention |
-| GPU (AMD RX 6600, OpenCL) — optimized | **20s** | tiled matmul, fused attention, parallel group_norm, register-tiled conv, fused norm+silu, GPU broadcast add |
+| GPU (AMD RX 6600, OpenCL) — optimized | **13.0s** | tiled matmul, fused attention, parallel group_norm, register-tiled conv, fused norm+silu, GPU broadcast add, device-resident chaining, Windows mmap |
+| GPU (NVIDIA RTX 4090, OpenCL) — RunPod | **2.9s** | same binary, same kernels — 4.4x faster than RX 6600 |
 
-**Goal: < 20 seconds — achieved at 19.8s.**
+### RTX 4090 breakdown (RunPod, Linux, OpenCL, 2 runs)
+
+| Stage | Run 1 | Run 2 |
+|-------|-------|-------|
+| CLIP | 313ms | 314ms |
+| UNet | 1272ms | 1183ms |
+| VAE | 1446ms | 1386ms |
+| **Total** | **3031ms** | **2883ms** |
+
+### RX 6600 breakdown (Windows, OpenCL)
+
+| Stage | Time |
+|-------|------|
+| CLIP | 1316ms |
+| UNet | 8060ms |
+| VAE | 3613ms |
+| **Total** | **13004ms** |
+
+**Goal: < 20 seconds — achieved at 13.0s (RX 6600) and 2.9s (RTX 4090).**
 
 Optimization steps (advised by Claude Fable 5.1):
 1. Batch CLIP linears (103s → 9s)
@@ -132,6 +166,10 @@ Optimization steps (advised by Claude Fable 5.1):
 6. Fused group_norm+SiLU kernel (30s → 22s)
 7. Register-tiled 3x3 conv2d kernel (22s → 22s VAE, UNet convs faster)
 8. GPU broadcast add for time-embedding (23s → 20s)
+9. Device-resident activation chaining — eliminate host↔device round-trips (UNet 17.5s → 12.0s, VAE 7.9s → 4.1s)
+10. Windows mmap via CreateFileMappingA — eliminate 5GB memcpy (UNet 12.0s → 8.0s)
+11. axpy_f32 GPU dispatch threshold (n≥4096) — avoid dispatch overhead for small vectors (CLIP 112s → 1.3s)
+12. Linux OpenCL port — dlopen libOpenCL.so.1, same kernels work on NVIDIA RTX 4090 (13.0s → 2.9s)
 
 ## Validation
 

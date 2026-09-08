@@ -49,7 +49,8 @@
     <div class="badges">
       <span class="badge green">✓ Numerically validated</span>
       <span class="badge">OpenCL GPU</span>
-      <span class="badge">AMD RX 6600</span>
+      <span class="badge">AMD RX 6600 · 13s</span>
+      <span class="badge">NVIDIA RTX 4090 · 2.9s</span>
       <span class="badge">512×512</span>
       <span class="badge"><a href="https://huggingface.co/stabilityai/sd-turbo">sd-turbo</a></span>
     </div>
@@ -104,23 +105,37 @@
   <section>
     <h2>Key stats</h2>
     <div class="stats">
-      <div class="stat"><div class="num">20s</div><div class="lbl">GPU runtime (goal: <20s ✓)</div></div>
+      <div class="stat"><div class="num">2.9s</div><div class="lbl">RTX 4090 (RunPod, OpenCL)</div></div>
+      <div class="stat"><div class="num">13.0s</div><div class="lbl">AMD RX 6600 (OpenCL)</div></div>
       <div class="stat"><div class="num">0.05</div><div class="lbl">pixel diff vs reference</div></div>
-      <div class="stat"><div class="num">1.0</div><div class="lbl">noise_pred correlation</div></div>
       <div class="stat"><div class="num">0</div><div class="lbl">Python deps at runtime</div></div>
     </div>
+  </section>
+
+  <section>
+    <h2>Performance breakdown</h2>
+    <table>
+      <tr><th>Stage</th><th>RTX 4090</th><th>RX 6600</th></tr>
+      <tr><td>CLIP text encoder</td><td>313ms</td><td>1316ms</td></tr>
+      <tr><td>UNet (1-step)</td><td>1228ms</td><td>8060ms</td></tr>
+      <tr><td>VAE decoder</td><td>1416ms</td><td>3613ms</td></tr>
+      <tr><td><strong>Total</strong></td><td><strong>2.96s</strong></td><td><strong>13.0s</strong></td></tr>
+    </table>
+    <p style="text-align:center;color:var(--muted);margin-top:1rem">
+      Same binary, same OpenCL kernels — 4.4× faster on RTX 4090. Linux + Windows, AMD + NVIDIA.
+    </p>
   </section>
 
   <section>
     <h2>What works</h2>
     <table>
       <tr><th>Component</th><th>Status</th></tr>
-      <tr><td>Safetensors reader (mmap + Windows fallback)</td><td>✅</td></tr>
+      <tr><td>Safetensors reader (mmap on Linux + Windows)</td><td>✅</td></tr>
       <tr><td>CLIP text encoder (23-layer, quick_gelu, causal mask)</td><td>✅</td></tr>
       <tr><td>UNet (conv + attention, 1-step)</td><td>✅</td></tr>
       <tr><td>EulerDiscreteScheduler (trailing spacing)</td><td>✅</td></tr>
       <tr><td>VAE decoder (latent → image)</td><td>✅</td></tr>
-      <tr><td>OpenCL GPU backend (conv2d, matmul, group_norm)</td><td>✅</td></tr>
+      <tr><td>OpenCL GPU backend (Linux + Windows, AMD + NVIDIA)</td><td>✅</td></tr>
       <tr><td>Per-stage validation vs diffusers/PyTorch</td><td>✅</td></tr>
     </table>
   </section>
@@ -138,9 +153,10 @@
      EulerDiscreteScheduler → denoised latent
                           ↓
      VAE decoder → 512×512 PPM image</code></pre>
-    <p>Safetensors files are used as-is — zero conversion. On POSIX they're mmap'd (zero-copy);
-    on Windows they're read into memory. Three hot primitives (<code>conv2d_f32</code>,
-    <code>matmul_f32</code>, <code>group_norm_f32</code>) dispatch to OpenCL automatically.</p>
+    <p>Safetensors files are used as-is — zero conversion. mmap'd on both POSIX and Windows
+    (CreateFileMappingA). Three hot primitives (<code>conv2d_f32</code>,
+    <code>matmul_f32</code>, <code>group_norm_f32</code>) dispatch to OpenCL automatically —
+    dynamically loading <code>OpenCL.dll</code> (Windows) or <code>libOpenCL.so.1</code> (Linux).</p>
   </section>
 
   <section>

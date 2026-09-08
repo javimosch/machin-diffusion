@@ -55,6 +55,7 @@ func main() {
         poke_f32(mt_b, 8, 30.0)
         mt_out := alloc(3 * 4)
         matmul_f32(mt_out, mt_x, mt_w, mt_b, 4, 3, 1)
+        ocl_sync()
         r0 := peek_f32(mt_out, 0)
         r1 := peek_f32(mt_out, 4)
         r2 := peek_f32(mt_out, 8)
@@ -74,6 +75,7 @@ func main() {
         poke_f32(cv_b, 0, 0.0)
         cv_out := alloc(9 * 4)
         conv2d_f32(cv_out, cv_in, cv_w, cv_b, 1, 1, 3, 3, 3, 3, 1, 1)
+        ocl_sync()
         cv0 := peek_f32(cv_out, 0)
         cv4 := peek_f32(cv_out, 4)
         cv8 := peek_f32(cv_out, 8)
@@ -112,41 +114,13 @@ func main() {
     println("CLIP done: " + str(seq) + " x " + str(clip_hidden) + " [" + str(t_clip) + "ms]")
     flush()
 
-    // Debug: CLIP embedding stats
-    clip_min := 1e30
-    clip_max := 0.0 - 1e30
-    clip_sum := 0.0
-    ci := 0
-    while ci < 77 * clip_hidden {
-        cv := peek_f32(clip_emb, ci * 4)
-        if cv < clip_min { clip_min = cv }
-        if cv > clip_max { clip_max = cv }
-        clip_sum = clip_sum + cv
-        ci = ci + 1
-    }
-    println("CLIP emb stats: min=" + str(clip_min) + " max=" + str(clip_max) + " mean=" + str(clip_sum / float(77 * clip_hidden)))
-    // Check first token (BOS) and prompt token (cat)
-    bos0 := peek_f32(clip_emb, 0)
-    cat0 := peek_f32(clip_emb, 1 * clip_hidden * 4)
-    println("CLIP BOS[0]=" + str(bos0) + " cat[0]=" + str(cat0))
-    flush()
-
-    // Dump CLIP embeddings for comparison with reference
-    write_file_raw(modelDir + "/clip_emb_mfl.bin", clip_emb, 77 * clip_hidden * 4)
-    println("dumped clip_emb_mfl.bin")
-    flush()
-
     // Free CLIP model memory before loading UNet (saves ~1.36GB)
     st_close()
-    println("freed CLIP model memory")
-    flush()
 
     // 3. Generate random latent noise
     println("=== Generating noise ===")
     latent := alloc(4 * 64 * 64 * 4)
     generate_noise(latent, 4 * 64 * 64)
-    // EulerDiscreteScheduler 1-step SD-Turbo (trailing spacing):
-    //   init_noise_sigma = sigma_max = 14.6146 (NOT sqrt(s^2+1) — that's leading)
     init_noise_sigma := 14.6146
     i := 0
     while i < 4 * 64 * 64 {
@@ -154,13 +128,8 @@ func main() {
         poke_f32(latent, i * 4, v * init_noise_sigma)
         i = i + 1
     }
-    // Dump initial latent (noise * init_noise_sigma) for comparison with reference
-    write_file_raw(modelDir + "/latent_init_mfl.bin", latent, 4 * 64 * 64 * 4)
-    println("dumped latent_init_mfl.bin")
-    flush()
 
     // 4. UNet forward pass (1-step SD-Turbo trailing: timestep=999, sigma=14.6146)
-    // scale_model_input: sample /= sqrt(sigma^2 + 1) — EulerDiscreteScheduler
     println("=== UNet forward pass ===")
     flush()
     t1 := now_ms()
@@ -172,67 +141,20 @@ func main() {
         poke_f32(unet_input, i * 4, peek_f32(latent, i * 4) * scale_in)
         i = i + 1
     }
-    flush()
     st_open(modelDir + "/unet/diffusion_pytorch_model.safetensors")
-    flush()
     noise_pred := unet_forward(unet_input, clip_emb, 999)
     free(unet_input)
     t_unet := now_ms() - t1
     println("UNet done [" + str(t_unet) + "ms]")
     flush()
 
-    // Debug: print noise_pred statistics
-    npmin := 1e30
-    npmax := 0.0 - 1e30
-    npsum := 0.0
-    npi := 0
-    while npi < 4 * 64 * 64 {
-        npv := peek_f32(noise_pred, npi * 4)
-        if npv < npmin { npmin = npv }
-        if npv > npmax { npmax = npv }
-        npsum = npsum + npv
-        npi = npi + 1
-    }
-    println("noise_pred stats: min=" + str(npmin) + " max=" + str(npmax) + " mean=" + str(npsum / float(4 * 64 * 64)))
-    flush()
-
-    // Dump noise_pred for comparison with reference
-    write_file_raw(modelDir + "/noise_pred_mfl.bin", noise_pred, 4 * 64 * 64 * 4)
-    println("dumped noise_pred_mfl.bin")
-    flush()
-
     // Free UNet model memory before loading VAE (saves ~3.46GB)
     st_close()
-    println("freed UNet model memory")
-    flush()
 
     // 5. Euler step (denoise)
     println("=== Scheduler step ===")
-    // SD-Turbo 1-step: sigma=0.0413 (from EulerDiscreteScheduler with 1 step)
     euler_step(latent, noise_pred, sigma, 4 * 64 * 64)
     free(noise_pred)
-
-    // Debug: print latent statistics after euler step
-    lmin := 1e30
-    lmax := 0.0 - 1e30
-    lsum := 0.0
-    labs_sum := 0.0
-    li := 0
-    while li < 4 * 64 * 64 {
-        lv := peek_f32(latent, li * 4)
-        if lv < lmin { lmin = lv }
-        if lv > lmax { lmax = lv }
-        lsum = lsum + lv
-        labs_sum = labs_sum + abs(lv)
-        li = li + 1
-    }
-    println("latent stats: min=" + str(lmin) + " max=" + str(lmax) + " mean=" + str(lsum / float(4 * 64 * 64)) + " abs_mean=" + str(labs_sum / float(4 * 64 * 64)))
-    flush()
-
-    // Dump final latent for comparison with reference
-    write_file_raw(modelDir + "/latent_final_mfl.bin", latent, 4 * 64 * 64 * 4)
-    println("dumped latent_final_mfl.bin")
-    flush()
 
     // 6. VAE decode
     println("=== VAE decode ===")

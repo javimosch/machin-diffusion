@@ -10,13 +10,17 @@ var vae_channels = []int{512, 512, 256, 128}  // up block output channels
 func vae_attention(out, in_buf, prefix, channels, h, w_dim) {
     seq := h * w_dim
 
+    // Ensure in_buf is on host (needed for residual at end)
+    ocl_sync()
+
     // GroupNorm
     w_gn_w, _ := st_tensor(prefix + ".group_norm.weight")
     w_gn_b, _ := st_tensor(prefix + ".group_norm.bias")
     normed := alloc(channels * h * w_dim * 4)
     group_norm(normed, in_buf, w_gn_w, w_gn_b, channels, h, w_dim, 32, 0.000001)
 
-    // Reshape [C, H, W] → [H*W, C]
+    // Reshape [C, H, W] → [H*W, C] — need normed on host
+    ocl_sync()
     hs := alloc(seq * channels * 4)
     y := 0
     while y < h {
@@ -61,7 +65,8 @@ func vae_attention(out, in_buf, prefix, channels, h, w_dim) {
     scores := alloc(seq * seq * 4)
     matmul_f32(scores, q, k, 0, channels, seq, seq)
 
-    // Softmax each row (scale + exp + normalize)
+    // Softmax each row (scale + exp + normalize) — need scores on host
+    ocl_sync()
     i := 0
     while i < seq {
         srow := scores + i * seq * 4
@@ -89,7 +94,8 @@ func vae_attention(out, in_buf, prefix, channels, h, w_dim) {
         i = i + 1
     }
 
-    // Transpose V: [seq, channels] → [channels, seq] for matmul
+    // Transpose V: [seq, channels] → [channels, seq] for matmul — need v on host
+    ocl_sync()
     v_t := alloc(channels * seq * 4)
     i = 0
     while i < seq {
@@ -118,7 +124,8 @@ func vae_attention(out, in_buf, prefix, channels, h, w_dim) {
     matmul_f32(proj_out, attn_out, w_out, b_out, channels, channels, seq)
     free(attn_out)
 
-    // Reshape back [H*W, C] → [C, H, W] and add residual
+    // Reshape back [H*W, C] → [C, H, W] and add residual — need proj_out and in_buf on host
+    ocl_sync()
     y = 0
     while y < h {
         x = 0
@@ -139,6 +146,8 @@ func vae_attention(out, in_buf, prefix, channels, h, w_dim) {
 
 // VAE ResNet block (no time embedding, just norm→SiLU→conv→norm→SiLU→conv→residual)
 func vae_resnet_block(out, in_buf, prefix, in_ch, out_ch, h, w_dim) {
+    // Ensure in_buf is on host (needed for residual axpy)
+    ocl_sync()
     tmp := alloc(in_ch * h * w_dim * 4)
 
     // norm1 + SiLU (fused GPU kernel)
@@ -253,6 +262,7 @@ func vae_decode(latent) (image) {
         if ub < 3 {
             up_h := h * 2
             up_w := w * 2
+            ocl_sync()
             upsampled := alloc(out_ch * up_h * up_w * 4)
             upsample_nearest(upsampled, x, out_ch, h, w)
             w_up_w, _ := st_tensor("decoder.up_blocks." + str(ub) + ".upsamplers.0.conv.weight")
@@ -284,6 +294,7 @@ func vae_decode(latent) (image) {
     image = alloc(3 * h * w * 4)
     conv2d(image, normed, w_cout_w, w_cout_b, 128, 3, h, w, 3, 3, 1, 1)
     free(normed)
+    ocl_sync()
     vt_out := now_ms() - vt0 - vt_conv_in - vt_mid - vt_up
     println("  vae conv_out: " + str(vt_out) + "ms")
     flush()

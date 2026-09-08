@@ -16,8 +16,8 @@ func resnet_block(out, in_buf, prefix, channels, h, w_dim, temb, temb_dim) {
 
 // ResNet block with potentially different in/out channels (for down block first resnet)
 func resnet_block_ch(out, in_buf, prefix, in_ch, out_ch, h, w_dim, temb, temb_dim) {
-    print("    resnet " + prefix + " (in=" + str(in_ch) + " out=" + str(out_ch) + ")...")
-    flush()
+    // Ensure in_buf is on host (needed for residual axpy later)
+    ocl_sync()
     tmp := alloc(in_ch * h * w_dim * 4)
 
     // norm1 + SiLU (fused GPU kernel)
@@ -68,8 +68,6 @@ func resnet_block_ch(out, in_buf, prefix, in_ch, out_ch, h, w_dim, temb, temb_di
     } else {
         axpy_f32(out, 1.0, in_buf, out_ch * h * w_dim)
     }
-    println(" done")
-    flush()
 }
 
 // ---- Spatial attention (self or cross) ----
@@ -97,8 +95,6 @@ func spatial_attention(out, hidden_states, context, prefix, seq, channels, ctx_d
     // This is fragile — let's just add a ctx_seq parameter.
     ctx_seq := seq
     if ctx_dim != channels { ctx_seq = 77 }  // CLIP context length
-    print(" [spatial_attn seq=" + str(seq) + " ctx_seq=" + str(ctx_seq) + " ch=" + str(channels) + " heads=" + str(heads) + "]")
-    flush()
 
     // Load Q/K/V weights
     w_q, _ := st_tensor(prefix + ".to_q.weight")
@@ -149,127 +145,73 @@ func spatial_attention(out, hidden_states, context, prefix, seq, channels, ctx_d
 //
 // hidden_states: [seq, channels], context: [ctx_seq, cross_dim]
 func transformer_block(out, hidden_states, context, prefix, seq, channels, ctx_seq, cross_dim, heads) {
-    print("      transformer_block " + prefix + " seq=" + str(seq) + "...")
-    flush()
-    // norm1 (LayerNorm over channels)
+    // Ensure hidden_states is on host (needed for residual)
+    ocl_sync()
+
+    // norm1 (GPU layer_norm_batch — chains with previous if possible)
     w_n1w, _ := st_tensor(prefix + ".norm1.weight")
     w_n1b, _ := st_tensor(prefix + ".norm1.bias")
     norm1_out := alloc(seq * channels * 4)
     if norm1_out == 0 { println(" alloc failed norm1")  exit(1) }
-    i := 0
-    while i < seq {
-        layer_norm(norm1_out + i * channels * 4, hidden_states + i * channels * 4, w_n1w, w_n1b, channels)
-        i = i + 1
-    }
-    print(" norm1 done")
-    flush()
+    layer_norm_batch_f32(norm1_out, hidden_states, w_n1w, w_n1b, seq, channels)
 
-    // attn1 (self-attention) — context = norm1_out
+    // attn1 (self-attention) — chains with norm1_out on device
     attn1_out := alloc(seq * channels * 4)
     if attn1_out == 0 { println(" alloc failed attn1")  exit(1) }
     spatial_attention(attn1_out, norm1_out, norm1_out, prefix + ".attn1", seq, channels, channels, heads)
     free(norm1_out)
-    print(" attn1 done")
-    flush()
 
-    // h = x + attn1_out
+    // h = hidden_states + attn1_out — sync attn1_out to host, then axpy (GPU)
+    ocl_sync()
     h := alloc(seq * channels * 4)
-    i = 0
-    while i < seq * channels {
-        poke_f32(h, i * 4, peek_f32(hidden_states, i * 4) + peek_f32(attn1_out, i * 4))
-        i = i + 1
-    }
+    copy_buf(h, hidden_states, seq * channels)
+    axpy_f32(h, 1.0, attn1_out, seq * channels)
     free(attn1_out)
 
-    // norm2
+    // norm2 (GPU) — chains with h on device
     w_n2w, _ := st_tensor(prefix + ".norm2.weight")
     w_n2b, _ := st_tensor(prefix + ".norm2.bias")
     norm2_out := alloc(seq * channels * 4)
-    i = 0
-    while i < seq {
-        layer_norm(norm2_out + i * channels * 4, h + i * channels * 4, w_n2w, w_n2b, channels)
-        i = i + 1
-    }
+    layer_norm_batch_f32(norm2_out, h, w_n2w, w_n2b, seq, channels)
 
-    // attn2 (cross-attention) — context from CLIP
+    // attn2 (cross-attention) — chains with norm2_out
     attn2_out := alloc(seq * channels * 4)
     spatial_attention(attn2_out, norm2_out, context, prefix + ".attn2", seq, channels, cross_dim, heads)
     free(norm2_out)
 
-    // h = h + attn2_out
-    i = 0
-    while i < seq * channels {
-        poke_f32(h, i * 4, peek_f32(h, i * 4) + peek_f32(attn2_out, i * 4))
-        i = i + 1
-    }
+    // h = h + attn2_out — sync attn2_out, axpy takes h from device
+    ocl_sync()
+    axpy_f32(h, 1.0, attn2_out, seq * channels)
     free(attn2_out)
 
-    // norm3
+    // norm3 (GPU) — chains with h
     w_n3w, _ := st_tensor(prefix + ".norm3.weight")
     w_n3b, _ := st_tensor(prefix + ".norm3.bias")
     norm3_out := alloc(seq * channels * 4)
-    i = 0
-    while i < seq {
-        layer_norm(norm3_out + i * channels * 4, h + i * channels * 4, w_n3w, w_n3b, channels)
-        i = i + 1
-    }
+    layer_norm_batch_f32(norm3_out, h, w_n3w, w_n3b, seq, channels)
 
-    // FeedForward: GeGLU
-    // ff.net.0.proj: Linear(channels, inner * 2) → split, gate with SiLU
-    // ff.net.2: Linear(inner, channels)
+    // FeedForward: GeGLU — all GPU, chains through
     w_ff1w, _ := st_tensor(prefix + ".ff.net.0.proj.weight")
     w_ff1b, _ := st_tensor(prefix + ".ff.net.0.proj.bias")
     w_ff2w, _ := st_tensor(prefix + ".ff.net.2.weight")
     w_ff2b, _ := st_tensor(prefix + ".ff.net.2.bias")
 
-    // inner_dim = channels * 4 (but weight shape tells us)
-    // ff.net.0.proj.weight shape: [inner*2, channels] → inner*2 = 2560 for 320ch → inner=1280
-    // ff.net.2.weight shape: [channels, inner] → [320, 1280]
     ff1_shape := st_shape(prefix + ".ff.net.0.proj.weight")
-    inner2 := ff1_shape[0]  // inner*2
+    inner2 := ff1_shape[0]
     inner := inner2 / 2
 
     ff_hidden := alloc(seq * inner2 * 4)
     ff_gated := alloc(seq * inner * 4)
-    // Batched ff.net.0.proj: channels → inner*2 for all seq positions
     matmul_f32(ff_hidden, norm3_out, w_ff1w, w_ff1b, channels, inner2, seq)
-    // GeGLU: split + gate with GELU (diffusers uses F.gelu, not SiLU)
-    // GELU tanh approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-    // tanh(z) = (e^(2z) - 1) / (e^(2z) + 1)
-    gelu_coeff := 0.7978845608  // sqrt(2/pi)
-    i = 0
-    while i < seq {
-        j := 0
-        while j < inner {
-            xv := peek_f32(ff_hidden, (i * inner2 + j) * 4)
-            gv := peek_f32(ff_hidden, (i * inner2 + inner + j) * 4)
-            // GELU(gate) via tanh approximation (numerically stable)
-            inner_val := gelu_coeff * (gv + 0.044715 * gv * gv * gv)
-            th := 1.0
-            if inner_val < 0.0 - 20.0 {
-                th = 0.0 - 1.0
-            } else if inner_val < 20.0 {
-                e2z := exp(2.0 * inner_val)
-                th = (e2z - 1.0) / (e2z + 1.0)  // tanh
-            }
-            gv = 0.5 * gv * (1.0 + th)
-            poke_f32(ff_gated, (i * inner + j) * 4, xv * gv)
-            j = j + 1
-        }
-        i = i + 1
-    }
-    // Batched ff.net.2: inner → channels for all seq positions
-    matmul_f32(out, ff_gated, w_ff2w, w_ff2b, inner, channels, seq)
-    free(ff_hidden)
-    free(ff_gated)
     free(norm3_out)
+    geglu_f32(ff_gated, ff_hidden, inner, seq)
+    free(ff_hidden)
+    matmul_f32(out, ff_gated, w_ff2w, w_ff2b, inner, channels, seq)
+    free(ff_gated)
 
-    // h = h + ff_out
-    i = 0
-    while i < seq * channels {
-        poke_f32(out, i * 4, peek_f32(out, i * 4) + peek_f32(h, i * 4))
-        i = i + 1
-    }
+    // h = h + ff_out — sync out, then axpy with h
+    ocl_sync()
+    axpy_f32(out, 1.0, h, seq * channels)
     free(h)
 }
 
@@ -281,9 +223,10 @@ func transformer_block(out, hidden_states, context, prefix, seq, channels, ctx_s
 // input: [C, H, W] → reshape to [H*W, C] → attention → reshape back → residual
 // use_linear_projection: true (proj_in/out are Linear, not Conv2d)
 func attention_block(out, in_buf, context, prefix, channels, h, w_dim, ctx_seq, cross_dim, heads) {
-    print("    attention " + prefix + "...")
-    flush()
     seq := h * w_dim
+
+    // Ensure in_buf is on host (needed as residual for transpose_add at the end)
+    ocl_sync()
 
     // GroupNorm
     w_gn_w, _ := st_tensor(prefix + ".norm.weight")
@@ -291,22 +234,9 @@ func attention_block(out, in_buf, context, prefix, channels, h, w_dim, ctx_seq, 
     normed := alloc(channels * h * w_dim * 4)
     group_norm(normed, in_buf, w_gn_w, w_gn_b, channels, h, w_dim, 32, 0.00001)
 
-    // Reshape [C, H, W] → [H*W, C] (transpose)
+    // Reshape [C, H, W] → [H*W, C] (transpose) — GPU builtin
     hs := alloc(seq * channels * 4)
-    y := 0
-    while y < h {
-        x := 0
-        while x < w_dim {
-            pos := y * w_dim + x
-            ci := 0
-            while ci < channels {
-                poke_f32(hs, (pos * channels + ci) * 4, peek_f32(normed, (ci * h * w_dim + y * w_dim + x) * 4))
-                ci = ci + 1
-            }
-            x = x + 1
-        }
-        y = y + 1
-    }
+    transpose_chw_f32(hs, normed, channels, h, w_dim)
     free(normed)
 
     // proj_in (batched Linear: channels → channels for all seq positions)
@@ -328,23 +258,7 @@ func attention_block(out, in_buf, context, prefix, channels, h, w_dim, ctx_seq, 
     matmul_f32(proj_out_out, tb_out, w_pout_w, w_pout_b, channels, channels, seq)
     free(tb_out)
 
-    // Reshape [H*W, C] → [C, H, W] (transpose back) and add residual
-    y = 0
-    while y < h {
-        x = 0
-        while x < w_dim {
-            pos := y * w_dim + x
-            ci = 0
-            while ci < channels {
-                idx := (ci * h * w_dim + y * w_dim + x) * 4
-                poke_f32(out, idx, peek_f32(in_buf, idx) + peek_f32(proj_out_out, (pos * channels + ci) * 4))
-                ci = ci + 1
-            }
-            x = x + 1
-        }
-        y = y + 1
-    }
+    // Reshape [H*W, C] → [C, H, W] (transpose back) and add residual — GPU builtin
+    transpose_add_chw_f32(out, in_buf, proj_out_out, channels, h, w_dim)
     free(proj_out_out)
-    println(" done")
-    flush()
 }

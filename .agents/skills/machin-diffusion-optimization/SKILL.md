@@ -5,14 +5,16 @@ description: Optimization history (434s → 19.8s), patterns that worked, and th
 
 # Optimization History and Roadmap
 
-## Current state: 19.8 seconds (was 434s, 22x speedup)
+## Current state: 2.9s on RTX 4090 / 13.0s on RX 6600 (was 434s — 149x speedup)
 
-| Stage | Time |
-|-------|------|
-| CLIP | 1.6s |
-| UNet | 12.2s |
-| VAE | 6.0s |
-| **Total** | **19.8s** |
+| Stage | RTX 4090 (RunPod) | RX 6600 (Windows) |
+|-------|-------------------|-------------------|
+| CLIP | 313ms | 1316ms |
+| UNet | 1228ms | 8060ms |
+| VAE | 1416ms | 3613ms |
+| **Total** | **2.96s** | **13.0s** |
+
+Same binary, same OpenCL kernels — 4.4x faster on RTX 4090. Linux + Windows, AMD + NVIDIA.
 
 ## What worked (8 passes, all advised by Claude Fable 5.1)
 
@@ -38,8 +40,49 @@ description: Optimization history (434s → 19.8s), patterns that worked, and th
 
 ## Roadmap (not yet done, from Fable 5.1)
 
+### Done: Device-resident activation chaining (pass 9)
+
+**What:** Single-buffer device-resident tracking (`mfl_dev_active`/`mfl_dev_host`/`mfl_dev_sz`). GPU wrappers try `mfl_dev_take(input)` before uploading; output stays on device via `mfl_dev_set()`. `mfl_dev_take` downloads the previous device buffer before releasing when the chain breaks. `ocl_sync()` builtin forces download before CPU reads.
+
+**Result:** UNet 17.5s→12.0s (31%), VAE 7.9s→4.1s (48%), total GPU compute ~25.4s→~16.1s (37%).
+
+**Critical correctness rules:**
+- `clFinish` MUST be called after every kernel dispatch (before releasing any input/weight buffers). Without it, the AMD OpenCL driver crashes with ACCESS_VIOLATION in `amdocl64.dll` because buffers are released while the kernel is still running.
+- `ocl_sync()` MUST be called before any CPU operation that reads GPU output (copy_buf, concat_chw_f32, upsample_nearest, peek_f32, CPU layer_norm loops).
+- `ocl_sync()` MUST be called at the start of resnet blocks and attention blocks — the input buffer is used both as kernel input (consumed from device) and as residual (needs host data). Without the sync, the residual reads stale host data.
+- `mfl_dev_take` MUST download the current device buffer before releasing it when the chain breaks. Without this, data is lost when a new GPU op needs a different input.
+- CLIP linear functions sync after every `matmul_f32` (CLIP has CPU attention/layer_norm that needs host data — chaining benefit is minimal for CLIP's small matmuls).
+
+**`clFinish` overhead:** The `clFinish` after every kernel prevents pipelining (kernels can't overlap). The benefit is still significant because downloads (PCIe transfers) are eliminated — only kernel execution time remains. Future optimization: use events for deferred buffer releases to enable pipelining.
+
+### Done: Windows mmap (pass 10)
+
+**What:** Implemented `CreateFileMappingA` + `MapViewOfFile` in `mfl_mmap_file` for Windows (was stubbed, returning 0/0). This enables lazy page-mapped file access instead of reading the entire safetensors file into memory.
+
+**Result:** UNet 12.0s→8.0s (33%), VAE 4.1s→3.6s (12%). Eliminated ~5GB of memcpy (3.5GB UNet + 334MB VAE + 1.3GB CLIP). File I/O dropped from ~110s to ~0s (pages loaded on demand during computation).
+
+**Caveat:** `#include <windows.h>` must appear before the mmap function in the generated C (the OpenCL section includes it later). Added a local include in the `#elif _WIN32` block.
+
+### Done: axpy_f32 GPU dispatch threshold (pass 11)
+
+**What:** Added `n >= 4096` threshold to `mfl_axpy_dispatch_f32`. Small vectors use CPU; large vectors use GPU.
+
+**Result:** CLIP 112s→1.3s (86x). The CLIP attention calls `axpy_f32` in a tight loop with 85-float vectors (head_dim=1024/12). Each GPU dispatch had ~0.26ms overhead (buffer create, upload, kernel, clFinish, release). 432K calls × 0.26ms = 112s. With CPU fallback for small vectors, the loop runs at full CPU speed.
+
+**Lesson:** GPU dispatch has fixed overhead (~0.1-0.3ms per call). For small operations (< 4096 floats = 16KB), CPU is always faster. Always add a size threshold when making a CPU builtin dispatch to GPU.
+
+### Done: Linux OpenCL port (pass 12)
+
+**What:** Ported the OpenCL backend from Windows-only (`#ifdef _WIN32`) to cross-platform (`#if defined(_WIN32) || defined(__linux__)`). On Linux, uses `dlopen`/`dlsym` instead of `LoadLibraryA`/`GetProcAddress`. Added `-ldl` linking when OpenCL is used on Linux. Requires ICD vendor file in `/etc/OpenCL/vendors/` (e.g. `nvidia.icd` containing path to `libnvidia-opencl.so.1`).
+
+**Result:** Same binary and kernels run on NVIDIA RTX 4090 via RunPod. RTX 4090: 2.9s total (CLIP 313ms, UNet 1228ms, VAE 1416ms) — 4.4x faster than RX 6600's 13.0s. Image output numerically identical across both GPUs.
+
+**Key changes:** `codegen.go` — platform abstraction macros (`MFL_OCL_LOAD`/`MFL_OCL_SYM`/`MFL_OCL_HANDLE`/`MFL_OCL_LIBNAME`), all `#ifdef _WIN32` guards in OpenCL section changed to `#if defined(_WIN32) || defined(__linux__)`. `build.go` — added `-ldl` for Linux when `mfl_ocl_init` is in the C source.
+
+**Caveat:** On RunPod pods, the NVIDIA OpenCL ICD file may not be pre-installed. Create `/etc/OpenCL/vendors/nvidia.icd` with the path to `libnvidia-opencl.so.1` (found via `ldconfig -p | grep libnvidia-opencl`).
+
 ### High-value next steps
-- **Device-resident activations** (`gpu_alloc`, builtins accept device handles) — eliminates ~8GB PCIe traffic, ~2s win. Biggest remaining architectural change.
+- **Event-based deferred releases** — replace `clFinish` after every kernel with OpenCL events. Buffers are released only after their kernel's event completes. Enables kernel pipelining (multiple kernels queued without blocking). Could save 2-4s on UNet.
 - **Buffer pool** keyed by size — saves `clCreateBuffer`/`Release` churn on 134MB buffers every call.
 - **fp16 weights** — after correctness infrastructure is stable. ~2x throughput.
 

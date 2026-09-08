@@ -3,10 +3,12 @@
 **Stable Diffusion Turbo inference in pure [machin](https://github.com/javimosch/machin) (MFL).**
 No Python, no PyTorch, no libtorch — one static binary. GPU-accelerated via OpenCL on AMD RX 6600.
 
+**Model:** [stabilityai/sd-turbo](https://huggingface.co/stabilityai/sd-turbo) — distilled SD 2.1 for single-step generation.
+
 ## Status: Full pipeline working, numerically validated
 
-The complete SD-Turbo pipeline runs end-to-end and produces output **byte-identical** to the
-canonical diffusers/PyTorch reference (pixel diff mean=0.05, max=2 out of 255).
+The complete SD-Turbo pipeline runs end-to-end and produces output numerically equivalent to the
+canonical diffusers/PyTorch reference (pixel diff mean=0.02, max=1 out of 255).
 
 | Component | Status |
 |-----------|--------|

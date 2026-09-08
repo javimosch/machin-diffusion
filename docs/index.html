@@ -51,6 +51,7 @@
       <span class="badge">OpenCL GPU</span>
       <span class="badge">AMD RX 6600</span>
       <span class="badge">512×512</span>
+      <span class="badge"><a href="https://huggingface.co/stabilityai/sd-turbo">sd-turbo</a></span>
     </div>
   </header>
 
@@ -61,7 +62,7 @@
       <div class="proof-card">
         <img src="images/girl-photo-1step.png" alt="MFL output">
         <div class="label">MFL (pure machin, OpenCL)</div>
-        <div class="meta">~7 min · byte-identical to reference</div>
+        <div class="meta">~20s · numerically equivalent to reference</div>
       </div>
       <div class="proof-card">
         <img src="images/girl-photo-std-pipeline.png" alt="diffusers reference">
@@ -71,7 +72,7 @@
     </div>
     <p style="text-align:center;color:var(--muted);margin-top:1rem">
       Both produce photo-like output with ~75% skin-tone coverage and smooth gradients.
-      Pixel diff: mean=0.05, max=2 out of 255.
+      Pixel diff: mean=0.02, max=1 out of 255.
     </p>
   </section>
 

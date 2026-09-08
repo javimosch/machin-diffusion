@@ -69,8 +69,8 @@ var clip_k = 0       // [max_pos, hidden] — key
 var clip_v = 0       // [max_pos, hidden] — value
 var clip_att = 0     // [max_pos, n_heads, max_pos] — attention scores
 var clip_attout = 0  // [max_pos, hidden] — attention output
-var clip_hb = 0      // [intermediate] — MLP hidden
-var clip_hb2 = 0     // [hidden] — MLP output
+var clip_hb = 0      // [max_pos, intermediate] — MLP hidden (batched)
+var clip_hb2 = 0     // [max_pos, hidden] — MLP output (batched)
 
 // Load CLIP weights from an already-opened safetensors file.
 // st_open() must have been called first.
@@ -136,8 +136,8 @@ func clip_alloc() {
     clip_v = alloc(clip_max_pos * clip_hidden * 4)
     clip_att = alloc(clip_max_pos * clip_n_heads * clip_max_pos * 4)
     clip_attout = alloc(clip_max_pos * clip_hidden * 4)
-    clip_hb = alloc(clip_intermediate * 4)
-    clip_hb2 = alloc(clip_hidden * 4)
+    clip_hb = alloc(clip_max_pos * clip_intermediate * 4)
+    clip_hb2 = alloc(clip_max_pos * clip_hidden * 4)
 }
 
 // ---- math kernels ----
@@ -195,6 +195,23 @@ func tanh_approx(x) (r) {
 // Uses native matmul_f32 (batch=1) for vectorized C speed.
 func linear(out, w, b, x, in_n, out_n) {
     matmul_f32(out, x, w, b, in_n, out_n, 1)
+}
+
+// Batched linear: out[b, o] = dot(x[b,:], w[o,:]) + bias[o]
+// x: [batch, in_n], w: [out_n, in_n], b: [out_n], out: [batch, out_n]
+func linear_batch(out, w, b, x, in_n, out_n, batch) {
+    matmul_f32(out, x, w, b, in_n, out_n, batch)
+}
+
+// Batched LayerNorm: normalizes each row of [batch, n] independently
+func layer_norm_batch(out, x, w, b, batch, n) {
+    pos := 0
+    while pos < batch {
+        row_out := out + pos * n * 4
+        row_x := x + pos * n * 4
+        layer_norm(row_out, row_x, w, b, n)
+        pos = pos + 1
+    }
 }
 
 // Linear layer without bias (b = 0)
@@ -278,36 +295,21 @@ func clip_forward(token_ids, seq) {
         pos = pos + 1
     }
 
-    // 2. Transformer layers
+    // 2. Transformer layers (batched: 6 matmul dispatches per layer, not 462)
     layer := 0
     while layer < clip_n_layers {
         // --- Self-Attention block ---
-        // Q, K, V projections for all positions (with LayerNorm1)
-        pos = 0
-        while pos < seq {
-            xrow := clip_x + pos * clip_hidden * 4
-            // LayerNorm1 on this position
-            ln_out := alloc(clip_hidden * 4)
-            layer_norm(ln_out, xrow, clip_w_ln1_w[layer], clip_w_ln1_b[layer], clip_hidden)
+        // Batched LayerNorm1 on all positions
+        ln_out := alloc(clip_max_pos * clip_hidden * 4)
+        layer_norm_batch(ln_out, clip_x, clip_w_ln1_w[layer], clip_w_ln1_b[layer], seq, clip_hidden)
 
-            // Q = W_q * ln_out + b_q
-            qrow := clip_q + pos * clip_hidden * 4
-            linear(qrow, clip_w_q_w[layer], clip_w_q_b[layer], ln_out, clip_hidden, clip_hidden)
-
-            // K = W_k * ln_out + b_k
-            krow := clip_k + pos * clip_hidden * 4
-            linear(krow, clip_w_k_w[layer], clip_w_k_b[layer], ln_out, clip_hidden, clip_hidden)
-
-            // V = W_v * ln_out + b_v
-            vrow := clip_v + pos * clip_hidden * 4
-            linear(vrow, clip_w_v_w[layer], clip_w_v_b[layer], ln_out, clip_hidden, clip_hidden)
-
-            free(ln_out)
-            pos = pos + 1
-        }
+        // Q, K, V: each is one batched matmul [seq, hidden] = W[hidden, hidden] * ln[seq, hidden]
+        linear_batch(clip_q, clip_w_q_w[layer], clip_w_q_b[layer], ln_out, clip_hidden, clip_hidden, seq)
+        linear_batch(clip_k, clip_w_k_w[layer], clip_w_k_b[layer], ln_out, clip_hidden, clip_hidden, seq)
+        linear_batch(clip_v, clip_w_v_w[layer], clip_w_v_b[layer], ln_out, clip_hidden, clip_hidden, seq)
+        free(ln_out)
 
         // Multi-head attention (causal)
-        // Clear attout
         pos = 0
         while pos < seq * clip_hidden {
             poke_f32(clip_attout, pos * 4, 0.0)
@@ -315,14 +317,10 @@ func clip_forward(token_ids, seq) {
         }
         head := 0
         while head < clip_n_heads {
-            // Run attention for this head, accumulate into attout
-            // We need a temp buffer for this head's output, then add to attout
             head_out := alloc(seq * clip_hidden * 4)
-            // Clear it
             j := 0
             while j < seq * clip_hidden { poke_f32(head_out, j * 4, 0.0)  j = j + 1 }
             attention_head(head_out, clip_q, clip_k, clip_v, seq, head)
-            // Accumulate into attout
             j = 0
             while j < seq * clip_hidden {
                 poke_f32(clip_attout, j * 4, peek_f32(clip_attout, j * 4) + peek_f32(head_out, j * 4))
@@ -332,48 +330,48 @@ func clip_forward(token_ids, seq) {
             head = head + 1
         }
 
-        // Out projection: att_out = W_o * attout + b_o, then residual add
+        // Out projection: batched, then residual add
+        proj_out := alloc(clip_max_pos * clip_hidden * 4)
+        linear_batch(proj_out, clip_w_o_w[layer], clip_w_o_b[layer], clip_attout, clip_hidden, clip_hidden, seq)
         pos = 0
         while pos < seq {
-            attrow := clip_attout + pos * clip_hidden * 4
             xrow := clip_x + pos * clip_hidden * 4
-            proj_out := alloc(clip_hidden * 4)
-            linear(proj_out, clip_w_o_w[layer], clip_w_o_b[layer], attrow, clip_hidden, clip_hidden)
-            // Residual: x = x + proj_out
+            prow := proj_out + pos * clip_hidden * 4
             i := 0
             while i < clip_hidden {
-                poke_f32(xrow, i * 4, peek_f32(xrow, i * 4) + peek_f32(proj_out, i * 4))
+                poke_f32(xrow, i * 4, peek_f32(xrow, i * 4) + peek_f32(prow, i * 4))
                 i = i + 1
             }
-            free(proj_out)
             pos = pos + 1
         }
-        // --- MLP block ---
+        free(proj_out)
+
+        // --- MLP block (batched) ---
+        ln2_out := alloc(clip_max_pos * clip_hidden * 4)
+        layer_norm_batch(ln2_out, clip_x, clip_w_ln2_w[layer], clip_w_ln2_b[layer], seq, clip_hidden)
+
+        // FC1: batched [seq, hidden] -> [seq, intermediate]
+        linear_batch(clip_hb, clip_w_fc1_w[layer], clip_w_fc1_b[layer], ln2_out, clip_hidden, clip_intermediate, seq)
+        free(ln2_out)
+
+        // GELU on all [seq, intermediate]
+        i := 0
+        while i < seq * clip_intermediate {
+            poke_f32(clip_hb, i * 4, gelu(peek_f32(clip_hb, i * 4)))
+            i = i + 1
+        }
+
+        // FC2: batched [seq, intermediate] -> [seq, hidden]
+        linear_batch(clip_hb2, clip_w_fc2_w[layer], clip_w_fc2_b[layer], clip_hb, clip_intermediate, clip_hidden, seq)
+
+        // Residual: x = x + hb2
         pos = 0
         while pos < seq {
             xrow := clip_x + pos * clip_hidden * 4
-            // LayerNorm2
-            ln_out := alloc(clip_hidden * 4)
-            layer_norm(ln_out, xrow, clip_w_ln2_w[layer], clip_w_ln2_b[layer], clip_hidden)
-
-            // FC1: hidden -> intermediate
-            linear(clip_hb, clip_w_fc1_w[layer], clip_w_fc1_b[layer], ln_out, clip_hidden, clip_intermediate)
-            free(ln_out)
-
-            // GELU
-            i := 0
-            while i < clip_intermediate {
-                poke_f32(clip_hb, i * 4, gelu(peek_f32(clip_hb, i * 4)))
-                i = i + 1
-            }
-
-            // FC2: intermediate -> hidden
-            linear(clip_hb2, clip_w_fc2_w[layer], clip_w_fc2_b[layer], clip_hb, clip_intermediate, clip_hidden)
-
-            // Residual: x = x + hb2
+            hrow := clip_hb2 + pos * clip_hidden * 4
             i = 0
             while i < clip_hidden {
-                poke_f32(xrow, i * 4, peek_f32(xrow, i * 4) + peek_f32(clip_hb2, i * 4))
+                poke_f32(xrow, i * 4, peek_f32(xrow, i * 4) + peek_f32(hrow, i * 4))
                 i = i + 1
             }
             pos = pos + 1

@@ -98,15 +98,18 @@ func main() {
 
     // 2. Load CLIP text encoder
     println("=== CLIP text encoder ===")
+    flush()
+    t0 := now_ms()
     st_open(modelDir + "/text_encoder/model.safetensors")
     clip_load()
     clip_alloc()
     clip_forward(token_ids, seq)
+    t_clip := now_ms() - t0
     // clip_x now has [77, 1024] text embeddings
     // Copy to a persistent buffer before switching safetensors files
     clip_emb := alloc(77 * clip_hidden * 4)
     copy_buf(clip_emb, clip_x, 77 * clip_hidden)
-    println("CLIP done: " + str(seq) + " x " + str(clip_hidden))
+    println("CLIP done: " + str(seq) + " x " + str(clip_hidden) + " [" + str(t_clip) + "ms]")
     flush()
 
     // Debug: CLIP embedding stats
@@ -160,6 +163,7 @@ func main() {
     // scale_model_input: sample /= sqrt(sigma^2 + 1) — EulerDiscreteScheduler
     println("=== UNet forward pass ===")
     flush()
+    t1 := now_ms()
     sigma := 14.6146
     scale_in := 1.0 / sqrt(sigma * sigma + 1.0)
     unet_input := alloc(4 * 64 * 64 * 4)
@@ -173,7 +177,8 @@ func main() {
     flush()
     noise_pred := unet_forward(unet_input, clip_emb, 999)
     free(unet_input)
-    println("UNet done")
+    t_unet := now_ms() - t1
+    println("UNet done [" + str(t_unet) + "ms]")
     flush()
 
     // Debug: print noise_pred statistics
@@ -232,10 +237,12 @@ func main() {
     // 6. VAE decode
     println("=== VAE decode ===")
     flush()
+    t2 := now_ms()
     st_open(modelDir + "/vae/diffusion_pytorch_model.safetensors")
     image := vae_decode(latent)
     free(latent)
-    println("VAE done")
+    t_vae := now_ms() - t2
+    println("VAE done [" + str(t_vae) + "ms]")
     flush()
 
     // 7. Write PPM image
@@ -243,6 +250,15 @@ func main() {
     flush()
     write_ppm(outPath, image, 512, 512)
     free(image)
+
+    // Timing summary
+    t_total := t_clip + t_unet + t_vae
+    println("=== Timing ===")
+    println("CLIP: " + str(t_clip) + "ms")
+    println("UNet: " + str(t_unet) + "ms")
+    println("VAE:  " + str(t_vae) + "ms")
+    println("Total: " + str(t_total) + "ms (" + str(t_total / 1000) + "s)")
+    flush()
 
     println("=== Complete! ===")
     println("Output: " + outPath)

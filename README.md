@@ -105,11 +105,17 @@ machin build machin-diffusion.mfl --target windows -o machin-diffusion.exe
 | Platform | Time | Notes |
 |----------|------|-------|
 | CPU (Intel i7-2700K, 8 threads) | 30+ min | scalar fp32, no SIMD |
-| GPU (AMD RX 6600, OpenCL) | **~7 min** | conv2d/matmul/group_norm on GPU |
+| GPU (AMD RX 6600, OpenCL) — initial | ~7 min | naive kernels, CPU attention |
+| GPU (AMD RX 6600, OpenCL) — optimized | **37s** | tiled matmul, fused attention, parallel group_norm |
 
-**Goal: < 1 minute.** The current bottleneck is model I/O — Windows mmap is stubbed, so
-~5GB of safetensors are read into RAM before compute starts. The optimization path:
-mmap fix, kernel fusion, and larger OpenCL workgroups.
+**Goal: < 1 minute — achieved at 37s.**
+
+Optimization steps (advised by Claude Fable 5.1):
+1. Batch CLIP linears (103s → 9s)
+2. Fused flash-attention-lite kernel for UNet (109s → 31s)
+3. VAE attention via 2x matmul_f32 (37s → 30s)
+4. Parallel group_norm with local memory reduction (30s → 24s)
+5. Tiled matmul with local memory (61s → 37s)
 
 ## Validation
 

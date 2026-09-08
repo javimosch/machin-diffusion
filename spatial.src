@@ -1,0 +1,76 @@
+// spatial.src — spatial primitives for UNet/VAE
+// conv2d, group_norm, silu, upsample, downsample
+// Feature maps are stored in NCHW (channel-first) format like PyTorch.
+
+// ---- Conv2d ----
+// Uses native conv2d_f32 builtin (auto-vectorized C) for ~50-100x speedup
+// over the scalar MFL loop. Same semantics: NCHW layout, PyTorch weight layout.
+func conv2d(out, in_buf, w, b, c_in, c_out, h, w_dim, kh, kw, pad, stride) {
+    conv2d_f32(out, in_buf, w, b, c_in, c_out, h, w_dim, kh, kw, pad, stride)
+}
+
+// ---- GroupNorm ----
+// Uses native group_norm_f32 (auto-vectorized C) for ~50x speedup over scalar MFL.
+// This is critical for the VAE at 512×512 where GroupNorm processes 33M+ elements.
+func group_norm(out, in_buf, gamma, beta, c, h, w_dim, groups, eps) {
+    group_norm_f32(out, in_buf, gamma, beta, c, h, w_dim, groups, eps)
+}
+
+// ---- SiLU (Swish) activation ----
+// Uses native silu_f32 (auto-vectorized C) for in-place SiLU.
+func silu_buf(buf, n) {
+    silu_f32(buf, n)
+}
+
+// ---- Downsample (stride-2 conv) ----
+// Just conv2d with stride=2, padding=1, kernel=3
+// Handled directly by conv2d with stride=2
+
+// ---- Upsample (nearest-2x interpolate + conv) ----
+// input: [C, H, W] → [C, H*2, W*2] (nearest) → conv2d(C, C, 3, pad=1)
+func upsample_nearest(out, in_buf, c, h, w_dim) {
+    h2 := h * 2
+    w2 := w_dim * 2
+    ci := 0
+    while ci < c {
+        y := 0
+        while y < h2 {
+            sy := y / 2
+            x := 0
+            while x < w2 {
+                sx := x / 2
+                poke_f32(out, (ci * h2 * w2 + y * w2 + x) * 4, peek_f32(in_buf, (ci * h * w_dim + sy * w_dim + sx) * 4))
+                x = x + 1
+            }
+            y = y + 1
+        }
+        ci = ci + 1
+    }
+}
+
+// ---- Element-wise add ----
+func add_buf(dst, src, n) {
+    i := 0
+    while i < n {
+        poke_f32(dst, i * 4, peek_f32(dst, i * 4) + peek_f32(src, i * 4))
+        i = i + 1
+    }
+}
+
+// ---- Copy buffer ----
+func copy_buf(dst, src, n) {
+    i := 0
+    while i < n {
+        poke_f32(dst, i * 4, peek_f32(src, i * 4))
+        i = i + 1
+    }
+}
+
+// ---- Zero buffer ----
+func zero_buf(buf, n) {
+    i := 0
+    while i < n {
+        poke_f32(buf, i * 4, 0.0)
+        i = i + 1
+    }
+}

@@ -1,0 +1,421 @@
+// unet.src — SD-Turbo UNet forward pass
+// Architecture: UNet2DConditionModel (SD 2.1 based)
+//   block_out_channels: [320, 640, 1280, 1280]
+//   attention_head_dim: [5, 10, 20, 20] → head_dim=64
+//   cross_attention_dim: 1024 (CLIP)
+//   layers_per_block: 2 (down), 3 (up)
+//   use_linear_projection: true
+//   norm_num_groups: 32, norm_eps: 1e-5
+//   in_channels: 4, out_channels: 4, sample_size: 64
+//   1-step generation (SD-Turbo)
+
+// ---- UNet config ----
+var unet_block_channels = []int{320, 640, 1280, 1280}
+var unet_head_dims = []int{5, 10, 20, 20}
+var unet_layers_per_block = 2
+var unet_cross_dim = 1024
+var unet_norm_groups = 32
+var unet_norm_eps = 0.00001
+var unet_in_channels = 4
+var unet_out_channels = 4
+var unet_sample_size = 64
+
+// ---- Time embedding ----
+// Sinusoidal positional embedding (dim=320), then Linear(320→1280)+SiLU+Linear(1280→1280)
+func unet_time_embedding(timestep) (temb) {
+    dim := unet_block_channels[0]  // 320
+    half := dim / 2
+    emb := alloc(dim * 4)
+    i := 0
+    while i < half {
+        freq := 1.0 / pow(10000.0, float(i) / float(half))
+        // flip_sin_to_cos = true, so args are (cos, sin) → (t*freq, t*freq)
+        arg := float(timestep) * freq
+        poke_f32(emb, i * 4, cos(arg))
+        poke_f32(emb, (i + half) * 4, sin(arg))
+        i = i + 1
+    }
+
+    // linear_1: 320 → 1280 + SiLU
+    w_l1w, _ := st_tensor("time_embedding.linear_1.weight")
+    w_l1b, _ := st_tensor("time_embedding.linear_1.bias")
+    tmp := alloc(1280 * 4)
+    linear(tmp, w_l1w, w_l1b, emb, 320, 1280)
+    silu_buf(tmp, 1280)
+    free(emb)
+
+    // linear_2: 1280 → 1280
+    w_l2w, _ := st_tensor("time_embedding.linear_2.weight")
+    w_l2b, _ := st_tensor("time_embedding.linear_2.bias")
+    temb = alloc(1280 * 4)
+    linear(temb, w_l2w, w_l2b, tmp, 1280, 1280)
+    free(tmp)
+    return
+}
+
+// ---- UNet forward pass ----
+// latent: [4, 64, 64] fp32 (noisy latent)
+// clip_emb: [77, 1024] fp32 (CLIP text embeddings)
+// timestep: int (e.g. 999 for 1-step)
+// output: [4, 64, 64] fp32 (noise prediction)
+func unet_forward(latent, clip_emb, timestep) (output) {
+    h := unet_sample_size   // 64
+    w := unet_sample_size   // 64
+
+    // 1. Time embedding
+    println("  time embedding...")
+    flush()
+    temb := unet_time_embedding(timestep)
+    println("  time embedding done")
+    flush()
+
+    // 2. conv_in: Conv2d(4, 320, 3, pad=1)
+    println("  conv_in...")
+    flush()
+    w_cin_w, _ := st_tensor("conv_in.weight")
+    w_cin_b, _ := st_tensor("conv_in.bias")
+    x := alloc(unet_block_channels[0] * h * w * 4)
+    if x == 0 { println("  alloc failed for conv_in output")  exit(1) }
+    println("  conv_in: 4->320 " + str(h) + "x" + str(w) + "...")
+    flush()
+    conv2d(x, latent, w_cin_w, w_cin_b, 4, 320, h, w, 3, 3, 1, 1)
+    println("  conv_in done")
+    flush()
+
+    // Debug: conv_in output stats
+    cin_min := 1e30
+    cin_max := 0.0 - 1e30
+    cin_sum := 0.0
+    ci_i := 0
+    while ci_i < 320 * h * w {
+        cv := peek_f32(x, ci_i * 4)
+        if cv < cin_min { cin_min = cv }
+        if cv > cin_max { cin_max = cv }
+        cin_sum = cin_sum + cv
+        ci_i = ci_i + 1
+    }
+    println("  conv_in stats: min=" + str(cin_min) + " max=" + str(cin_max) + " mean=" + str(cin_sum / float(320 * h * w)))
+    flush()
+
+    // Skip connections (stored for up blocks)
+    // Diffusers saves: conv_in output first, then after each resnet+attn, then downsampler output
+    // Total: 1 (conv_in) + 3+3+3+2 (down blocks) = 12 skips
+    // Up blocks consume 3 each (in reverse)
+    skips := []int{}
+
+    // Save conv_in output as first skip (320 ch, h=64)
+    skip0 := alloc(320 * h * w * 4)
+    copy_buf(skip0, x, 320 * h * w)
+    skips = append(skips, skip0)
+
+    // 3. Down blocks
+    db := 0
+    while db < 4 {
+        ch := unet_block_channels[db]
+        heads := unet_head_dims[db]
+        has_attn := db < 3  // down_blocks.3 has no attention
+        println("  down_block " + str(db) + " (ch=" + str(ch) + " h=" + str(h) + ")")
+        flush()
+
+        l := 0
+        while l < unet_layers_per_block {
+            // ResNet — first layer may change channels (db > 0)
+            res_out := alloc(ch * h * w * 4)
+            if l == 0 && db > 0 {
+                // First resnet in blocks 1-3: in_ch = previous block's channels, out_ch = ch
+                prev_ch := unet_block_channels[db - 1]
+                resnet_block_ch(res_out, x, "down_blocks." + str(db) + ".resnets." + str(l), prev_ch, ch, h, w, temb, 1280)
+            } else {
+                resnet_block(res_out, x, "down_blocks." + str(db) + ".resnets." + str(l), ch, h, w, temb, 1280)
+            }
+            free(x)
+            x = res_out
+
+            // Attention (if present)
+            if has_attn {
+                att_out := alloc(ch * h * w * 4)
+                attention_block(att_out, x, clip_emb, "down_blocks." + str(db) + ".attentions." + str(l), ch, h, w, 77, unet_cross_dim, heads)
+                free(x)
+                x = att_out
+                // Debug: first attention output stats
+                if db == 0 && l == 0 {
+                    att_min := 1e30
+                    att_max := 0.0 - 1e30
+                    att_sum := 0.0
+                    ai := 0
+                    while ai < ch * h * w {
+                        av := peek_f32(x, ai * 4)
+                        if av < att_min { att_min = av }
+                        if av > att_max { att_max = av }
+                        att_sum = att_sum + av
+                        ai = ai + 1
+                    }
+                    println("  attn0 stats: min=" + str(att_min) + " max=" + str(att_max) + " mean=" + str(att_sum / float(ch * h * w)))
+                    flush()
+                }
+            }
+
+            // Save skip connection
+            skip_copy := alloc(ch * h * w * 4)
+            copy_buf(skip_copy, x, ch * h * w)
+            skips = append(skips, skip_copy)
+            l = l + 1
+        }
+
+        // Downsampler (except last block)
+        if db < 3 {
+            w_ds_w, _ := st_tensor("down_blocks." + str(db) + ".downsamplers.0.conv.weight")
+            w_ds_b, _ := st_tensor("down_blocks." + str(db) + ".downsamplers.0.conv.bias")
+            ds_out := alloc(ch * (h / 2) * (w / 2) * 4)
+            conv2d(ds_out, x, w_ds_w, w_ds_b, ch, ch, h, w, 3, 3, 1, 2)
+            free(x)
+            x = ds_out
+            // Save downsampler output as skip too
+            skip_copy = alloc(ch * (h / 2) * (w / 2) * 4)
+            copy_buf(skip_copy, x, ch * (h / 2) * (w / 2))
+            skips = append(skips, skip_copy)
+            h = h / 2
+            w = w / 2
+        }
+        db = db + 1
+    }
+
+    // 4. Mid block
+    println("  mid_block (ch=1280 h=" + str(h) + ")")
+    // resnet_0 + attention + resnet_1
+    mid_res0 := alloc(1280 * h * w * 4)
+    resnet_block(mid_res0, x, "mid_block.resnets.0", 1280, h, w, temb, 1280)
+    free(x)
+    x = mid_res0
+
+    mid_att := alloc(1280 * h * w * 4)
+    attention_block(mid_att, x, clip_emb, "mid_block.attentions.0", 1280, h, w, 77, unet_cross_dim, 20)
+    free(x)
+    x = mid_att
+
+    mid_res1 := alloc(1280 * h * w * 4)
+    resnet_block(mid_res1, x, "mid_block.resnets.1", 1280, h, w, temb, 1280)
+    free(x)
+    x = mid_res1
+
+    // 5. Up blocks
+    // Up blocks consume skips in reverse order (3 per block)
+    // Upsampler is at the END of each up block (after all resnets)
+    // up_blocks.0-2 have upsamplers, up_blocks.3 does not
+    skip_idx := len(skips) - 1
+
+    ub := 0
+    while ub < 4 {
+        // Up block index maps to down block in reverse: ub=0 → db=3, ub=1 → db=2, etc.
+        db_match := 3 - ub
+        ch := unet_block_channels[db_match]
+        heads := unet_head_dims[db_match]
+        has_attn := db_match < 3  // up_blocks.0 (matching down_blocks.3) has no attention
+        n_resnets := unet_layers_per_block + 1  // 3
+        has_upsample := ub < 3  // up_blocks.0-2 have upsamplers, up_blocks.3 does not
+
+        println("  up_block " + str(ub) + " (ch=" + str(ch) + " h=" + str(h) + ")")
+        flush()
+
+        // Current input channels (from previous block or mid_block)
+        // mid_block outputs 1280; up_blocks.0 is 1280; up_blocks.1 is 1280
+        // up_blocks.2 is 640 (but input from up_blocks.1 upsampler is 1280)
+        // up_blocks.3 is 320 (but input from up_blocks.2 upsampler is 640)
+        x_ch := 1280  // from mid_block
+        if ub == 2 { x_ch = 1280 }  // from up_blocks.1 upsampler (1280 ch)
+        if ub == 3 { x_ch = 640 }   // from up_blocks.2 upsampler (640 ch)
+
+        l := 0
+        while l < n_resnets {
+            // Pop skip connection (LIFO)
+            skip := skips[skip_idx]
+            skip_idx = skip_idx - 1
+
+            // Determine total input channels from conv1 weight shape
+            conv1_shape := st_shape("up_blocks." + str(ub) + ".resnets." + str(l) + ".conv1.weight")
+            in_ch := conv1_shape[1]  // total input channels (x_ch + skip_ch)
+            skip_ch := in_ch - x_ch
+
+            print("    resnet up_blocks." + str(ub) + ".resnets." + str(l) + " (in=" + str(in_ch) + " out=" + str(ch) + ")...")
+            flush()
+
+            // Concatenate [x; skip] along channel dimension
+            cat := alloc(in_ch * h * w * 4)
+            // Copy x channels first
+            i := 0
+            while i < h * w {
+                j := 0
+                while j < x_ch {
+                    poke_f32(cat, (j * h * w + i) * 4, peek_f32(x, (j * h * w + i) * 4))
+                    j = j + 1
+                }
+                // Copy skip channels after x
+                j = 0
+                while j < skip_ch {
+                    poke_f32(cat, ((x_ch + j) * h * w + i) * 4, peek_f32(skip, (j * h * w + i) * 4))
+                    j = j + 1
+                }
+                i = i + 1
+            }
+            free(skip)
+
+            // ResNet (with concatenated input)
+            res_out := alloc(ch * h * w * 4)
+            resnet_block_up(res_out, cat, "up_blocks." + str(ub) + ".resnets." + str(l), ch, in_ch, h, w, temb, 1280)
+            free(cat)
+            free(x)
+            x = res_out
+            x_ch = ch  // after first resnet, x has ch channels
+
+            // Attention (if present)
+            if has_attn {
+                att_out := alloc(ch * h * w * 4)
+                attention_block(att_out, x, clip_emb, "up_blocks." + str(ub) + ".attentions." + str(l), ch, h, w, 77, unet_cross_dim, heads)
+                free(x)
+                x = att_out
+            }
+
+            l = l + 1
+        }
+
+        // Upsampler at the END of the up block (after all resnets)
+        if has_upsample {
+            print("    upsampler up_blocks." + str(ub) + "...")
+            flush()
+            up_h := h * 2
+            up_w := w * 2
+            upsampled := alloc(ch * up_h * up_w * 4)
+            upsample_nearest(upsampled, x, ch, h, w)
+            w_up_w, _ := st_tensor("up_blocks." + str(ub) + ".upsamplers.0.conv.weight")
+            w_up_b, _ := st_tensor("up_blocks." + str(ub) + ".upsamplers.0.conv.bias")
+            up_out := alloc(ch * up_h * up_w * 4)
+            conv2d(up_out, upsampled, w_up_w, w_up_b, ch, ch, up_h, up_w, 3, 3, 1, 1)
+            free(upsampled)
+            free(x)
+            x = up_out
+            h = up_h
+            w = up_w
+            println(" done (h=" + str(h) + ")")
+            flush()
+        }
+        ub = ub + 1
+    }
+
+    // 6. conv_norm_out: GroupNorm(32, 320) + SiLU
+    println("  conv_norm_out...")
+    w_cno_w, _ := st_tensor("conv_norm_out.weight")
+    w_cno_b, _ := st_tensor("conv_norm_out.bias")
+    normed := alloc(320 * h * w * 4)
+    group_norm(normed, x, w_cno_w, w_cno_b, 320, h, w, 32, 0.00001)
+    silu_buf(normed, 320 * h * w)
+    free(x)
+
+    // 7. conv_out: Conv2d(320, 4, 3, pad=1)
+    println("  conv_out...")
+    w_cout_w, _ := st_tensor("conv_out.weight")
+    w_cout_b, _ := st_tensor("conv_out.bias")
+    output = alloc(4 * h * w * 4)
+    conv2d(output, normed, w_cout_w, w_cout_b, 320, 4, h, w, 3, 3, 1, 1)
+
+    // Debug: conv_norm_out and conv_out stats
+    cno_min := 1e30
+    cno_max := 0.0 - 1e30
+    cno_i := 0
+    while cno_i < 320 * h * w {
+        cnv := peek_f32(normed, cno_i * 4)
+        if cnv < cno_min { cno_min = cnv }
+        if cnv > cno_max { cno_max = cnv }
+        cno_i = cno_i + 1
+    }
+    println("  conv_norm_out stats: min=" + str(cno_min) + " max=" + str(cno_max))
+    co_min := 1e30
+    co_max := 0.0 - 1e30
+    co_i := 0
+    while co_i < 4 * h * w {
+        cov := peek_f32(output, co_i * 4)
+        if cov < co_min { co_min = cov }
+        if cov > co_max { co_max = cov }
+        co_i = co_i + 1
+    }
+    println("  conv_out stats: min=" + str(co_min) + " max=" + str(co_max))
+    flush()
+    free(normed)
+
+    // Free remaining skips
+    for _, s := range skips {
+        if skip_idx >= 0 && s != 0 { free(s) }
+    }
+    free(temb)
+    return
+}
+
+// ResNet block for up blocks (input channels may differ from output channels)
+// The first conv1 takes in_ch → ch, second conv2 takes ch → ch
+func resnet_block_up(out, in_buf, prefix, ch, in_ch, h, w_dim, temb, temb_dim) {
+    // norm1 operates over in_ch channels, so tmp must hold in_ch channels
+    tmp := alloc(in_ch * h * w_dim * 4)
+
+    // norm1 (GroupNorm over in_ch channels)
+    w_n1w, _ := st_tensor(prefix + ".norm1.weight")
+    w_n1b, _ := st_tensor(prefix + ".norm1.bias")
+    group_norm(tmp, in_buf, w_n1w, w_n1b, in_ch, h, w_dim, 32, 0.00001)
+
+    silu_buf(tmp, in_ch * h * w_dim)
+
+    // conv1: in_ch → ch (3×3, pad=1)
+    w_c1w, _ := st_tensor(prefix + ".conv1.weight")
+    w_c1b, _ := st_tensor(prefix + ".conv1.bias")
+    conv2d(out, tmp, w_c1w, w_c1b, in_ch, ch, h, w_dim, 3, 3, 1, 1)
+    free(tmp)
+
+    // Time embedding projection
+    w_tepw, _ := st_tensor(prefix + ".time_emb_proj.weight")
+    w_tepb, _ := st_tensor(prefix + ".time_emb_proj.bias")
+    temb_proj := alloc(ch * 4)
+    temb_silu := alloc(temb_dim * 4)
+    copy_buf(temb_silu, temb, temb_dim)
+    silu_buf(temb_silu, temb_dim)
+    linear(temb_proj, w_tepw, w_tepb, temb_silu, temb_dim, ch)
+    free(temb_silu)
+
+    y := 0
+    while y < h {
+        x := 0
+        while x < w_dim {
+            ci := 0
+            while ci < ch {
+                idx := (ci * h * w_dim + y * w_dim + x) * 4
+                poke_f32(out, idx, peek_f32(out, idx) + peek_f32(temb_proj, ci * 4))
+                ci = ci + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    free(temb_proj)
+
+    // norm2
+    tmp2 := alloc(ch * h * w_dim * 4)
+    w_n2w, _ := st_tensor(prefix + ".norm2.weight")
+    w_n2b, _ := st_tensor(prefix + ".norm2.bias")
+    group_norm(tmp2, out, w_n2w, w_n2b, ch, h, w_dim, 32, 0.00001)
+    silu_buf(tmp2, ch * h * w_dim)
+
+    // conv2: ch → ch
+    w_c2w, _ := st_tensor(prefix + ".conv2.weight")
+    w_c2b, _ := st_tensor(prefix + ".conv2.bias")
+    conv2d(out, tmp2, w_c2w, w_c2b, ch, ch, h, w_dim, 3, 3, 1, 1)
+    free(tmp2)
+
+    // Residual: need conv_shortcut if in_ch != ch
+    if in_ch != ch {
+        w_sc_w, _ := st_tensor(prefix + ".conv_shortcut.weight")
+        w_sc_b, _ := st_tensor(prefix + ".conv_shortcut.bias")
+        shortcut := alloc(ch * h * w_dim * 4)
+        conv2d(shortcut, in_buf, w_sc_w, w_sc_b, in_ch, ch, h, w_dim, 1, 1, 0, 1)
+        add_buf(out, shortcut, ch * h * w_dim)
+        free(shortcut)
+    } else {
+        add_buf(out, in_buf, ch * h * w_dim)
+    }
+}

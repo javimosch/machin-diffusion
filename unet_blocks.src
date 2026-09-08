@@ -1,0 +1,412 @@
+// unet_blocks.src — ResNet block, Transformer block, Attention for UNet
+// SD-Turbo UNet: ResNet blocks (GroupNorm+SiLU+Conv2d+time_emb),
+//   spatial self-attention (attn1), cross-attention with CLIP (attn2),
+//   FeedForward (GeGLU).
+
+// ---- ResNet block ----
+// Tensor names: {prefix}.norm1.{weight,bias}, {prefix}.conv1.{weight,bias},
+//   {prefix}.time_emb_proj.{weight,bias}, {prefix}.norm2.{weight,bias},
+//   {prefix}.conv2.{weight,bias}
+// Flow: norm1→SiLU→conv1→+time_emb→norm2→SiLU→conv2→+residual
+// channels: block channel count, h/w: spatial dims
+// temb: [1280] time embedding (already SiLU'd? no — we apply SiLU to temb here)
+func resnet_block(out, in_buf, prefix, channels, h, w_dim, temb, temb_dim) {
+    resnet_block_ch(out, in_buf, prefix, channels, channels, h, w_dim, temb, temb_dim)
+}
+
+// ResNet block with potentially different in/out channels (for down block first resnet)
+func resnet_block_ch(out, in_buf, prefix, in_ch, out_ch, h, w_dim, temb, temb_dim) {
+    print("    resnet " + prefix + " (in=" + str(in_ch) + " out=" + str(out_ch) + ")...")
+    flush()
+    tmp := alloc(in_ch * h * w_dim * 4)
+
+    // norm1 (GroupNorm over in_ch channels)
+    w_n1w, _ := st_tensor(prefix + ".norm1.weight")
+    w_n1b, _ := st_tensor(prefix + ".norm1.bias")
+    group_norm(tmp, in_buf, w_n1w, w_n1b, in_ch, h, w_dim, 32, 0.00001)
+
+    // SiLU
+    silu_buf(tmp, in_ch * h * w_dim)
+
+    // conv1: in_ch → out_ch (3×3, pad=1)
+    w_c1w, _ := st_tensor(prefix + ".conv1.weight")
+    w_c1b, _ := st_tensor(prefix + ".conv1.bias")
+    conv2d(out, tmp, w_c1w, w_c1b, in_ch, out_ch, h, w_dim, 3, 3, 1, 1)
+    free(tmp)
+
+    // Add time embedding projection
+    w_tepw, _ := st_tensor(prefix + ".time_emb_proj.weight")
+    w_tepb, _ := st_tensor(prefix + ".time_emb_proj.bias")
+    temb_proj := alloc(out_ch * 4)
+    temb_silu := alloc(temb_dim * 4)
+    copy_buf(temb_silu, temb, temb_dim)
+    silu_buf(temb_silu, temb_dim)
+    linear(temb_proj, w_tepw, w_tepb, temb_silu, temb_dim, out_ch)
+    free(temb_silu)
+
+    // Add temb_proj to each spatial position
+    y := 0
+    while y < h {
+        x := 0
+        while x < w_dim {
+            ci := 0
+            while ci < out_ch {
+                idx := (ci * h * w_dim + y * w_dim + x) * 4
+                poke_f32(out, idx, peek_f32(out, idx) + peek_f32(temb_proj, ci * 4))
+                ci = ci + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    free(temb_proj)
+
+    // norm2
+    tmp2 := alloc(out_ch * h * w_dim * 4)
+    w_n2w, _ := st_tensor(prefix + ".norm2.weight")
+    w_n2b, _ := st_tensor(prefix + ".norm2.bias")
+    group_norm(tmp2, out, w_n2w, w_n2b, out_ch, h, w_dim, 32, 0.00001)
+
+    // SiLU
+    silu_buf(tmp2, out_ch * h * w_dim)
+
+    // conv2: out_ch → out_ch
+    w_c2w, _ := st_tensor(prefix + ".conv2.weight")
+    w_c2b, _ := st_tensor(prefix + ".conv2.bias")
+    conv2d(out, tmp2, w_c2w, w_c2b, out_ch, out_ch, h, w_dim, 3, 3, 1, 1)
+    free(tmp2)
+
+    // Residual: need conv_shortcut if in_ch != out_ch
+    if in_ch != out_ch {
+        w_sc_w, _ := st_tensor(prefix + ".conv_shortcut.weight")
+        w_sc_b, _ := st_tensor(prefix + ".conv_shortcut.bias")
+        shortcut := alloc(out_ch * h * w_dim * 4)
+        conv2d(shortcut, in_buf, w_sc_w, w_sc_b, in_ch, out_ch, h, w_dim, 1, 1, 0, 1)
+        add_buf(out, shortcut, out_ch * h * w_dim)
+        free(shortcut)
+    } else {
+        add_buf(out, in_buf, out_ch * h * w_dim)
+    }
+    println(" done")
+    flush()
+}
+
+// ---- Spatial attention (self or cross) ----
+// For self-attention (attn1): qkv all from hidden_states
+// For cross-attention (attn2): q from hidden_states, kv from context (CLIP embeddings)
+//
+// Tensor names: {prefix}.to_q.weight, .to_k.weight, .to_v.weight,
+//   .to_out.0.weight, .to_out.0.bias
+// (No bias on q/k/v, only on out)
+//
+// hidden_states: [H*W, channels] (reshaped from [C, H, W] → [H*W, C])
+// context: [seq, cross_dim] for cross-attn, or hidden_states for self-attn
+// heads: number of attention heads, head_dim = channels / heads
+func spatial_attention(out, hidden_states, context, prefix, seq, channels, ctx_dim, heads) {
+    head_dim := channels / heads
+    scale := 1.0 / sqrt(float(head_dim))
+    // For self-attention: ctx_seq == seq, context == hidden_states
+    // For cross-attention: ctx_seq == 77 (CLIP), seq == H*W (spatial)
+    // We need ctx_seq to size K/V correctly. For self-attn, ctx_seq = seq.
+    // The caller passes context; we infer ctx_seq from whether ctx_dim == channels
+    // and context == hidden_states (self) or not (cross).
+    // Actually, we need ctx_seq passed in. Let's add it as a parameter.
+    // For now, infer: if ctx_dim == channels, assume self-attn (ctx_seq = seq).
+    // If ctx_dim != channels, it's cross-attn with 77 CLIP tokens.
+    // This is fragile — let's just add a ctx_seq parameter.
+    ctx_seq := seq
+    if ctx_dim != channels { ctx_seq = 77 }  // CLIP context length
+    print(" [spatial_attn seq=" + str(seq) + " ctx_seq=" + str(ctx_seq) + " ch=" + str(channels) + " heads=" + str(heads) + "]")
+    flush()
+
+    // Load Q/K/V weights
+    w_q, _ := st_tensor(prefix + ".to_q.weight")
+    w_k, _ := st_tensor(prefix + ".to_k.weight")
+    w_v, _ := st_tensor(prefix + ".to_v.weight")
+    w_out, _ := st_tensor(prefix + ".to_out.0.weight")
+    b_out, _ := st_tensor(prefix + ".to_out.0.bias")
+
+    // Q = hidden_states @ to_q.weight^T  → [seq, channels]
+    q := alloc(seq * channels * 4)
+    // K = context @ to_k.weight^T  → [ctx_seq, channels]
+    k := alloc(ctx_seq * channels * 4)
+    // V = context @ to_v.weight^T  → [ctx_seq, channels]
+    v := alloc(ctx_seq * channels * 4)
+
+    // Compute Q — batched matmul (all query positions at once)
+    matmul_f32(q, hidden_states, w_q, 0, channels, channels, seq)
+    // Compute K, V — batched matmul (all context positions at once)
+    matmul_f32(k, context, w_k, 0, ctx_dim, channels, ctx_seq)
+    matmul_f32(v, context, w_v, 0, ctx_dim, channels, ctx_seq)
+
+    // Multi-head attention — uses native dot_f32 for scores, axpy_f32 for V accumulation
+    attn_out := alloc(seq * channels * 4)
+    zero_buf(attn_out, seq * channels)
+
+    scores := alloc(ctx_seq * 4)
+
+    head := 0
+    while head < heads {
+        q_off := head * head_dim
+        i := 0
+        while i < seq {
+            // Compute attention scores over context positions (native dot_f32)
+            mx := 0.0 - 1e30
+            j := 0
+            while j < ctx_seq {
+                dot := dot_f32(q + (i * channels + q_off) * 4, k + (j * channels + q_off) * 4, head_dim)
+                dot = dot * scale
+                poke_f32(scores, j * 4, dot)
+                if dot > mx { mx = dot }
+                j = j + 1
+            }
+            // Softmax: normalize scores so they sum to 1
+            sum := 0.0
+            j = 0
+            while j < ctx_seq {
+                e := exp(peek_f32(scores, j * 4) - mx)
+                poke_f32(scores, j * 4, e)
+                sum = sum + e
+                j = j + 1
+            }
+            inv_sum := 1.0 / sum
+            j = 0
+            while j < ctx_seq {
+                poke_f32(scores, j * 4, peek_f32(scores, j * 4) * inv_sum)
+                j = j + 1
+            }
+            // Weighted sum of V — native axpy_f32
+            // attn_out[i, q_off:q_off+hd] += scores[j] * V[j, q_off:q_off+hd]
+            j = 0
+            while j < ctx_seq {
+                s := peek_f32(scores, j * 4)
+                axpy_f32(attn_out + (i * channels + q_off) * 4, s, v + (j * channels + q_off) * 4, head_dim)
+                j = j + 1
+            }
+            i = i + 1
+        }
+        head = head + 1
+    }
+
+    // Output projection: batched matmul (all positions at once)
+    matmul_f32(out, attn_out, w_out, b_out, channels, channels, seq)
+
+    free(q)
+    free(k)
+    free(v)
+    free(attn_out)
+    free(scores)
+}
+
+// ---- Transformer block (used in UNet attention) ----
+// Tensor names: {prefix}.norm1.{weight,bias}, .norm2.{weight,bias}, .norm3.{weight,bias}
+//   .attn1.to_q.weight, .attn1.to_k.weight, .attn1.to_v.weight, .attn1.to_out.0.{weight,bias}
+//   .attn2.to_q.weight, .attn2.to_k.weight, .attn2.to_v.weight, .attn2.to_out.0.{weight,bias}
+//   .ff.net.0.proj.{weight,bias}, .ff.net.2.{weight,bias}
+//
+// Flow:
+//   h = x + attn1(norm1(x))           — self-attention
+//   h = h + attn2(norm2(h), context)  — cross-attention
+//   h = h + ff(norm3(h))              — feed-forward (GeGLU)
+//
+// hidden_states: [seq, channels], context: [ctx_seq, cross_dim]
+func transformer_block(out, hidden_states, context, prefix, seq, channels, ctx_seq, cross_dim, heads) {
+    print("      transformer_block " + prefix + " seq=" + str(seq) + "...")
+    flush()
+    // norm1 (LayerNorm over channels)
+    w_n1w, _ := st_tensor(prefix + ".norm1.weight")
+    w_n1b, _ := st_tensor(prefix + ".norm1.bias")
+    norm1_out := alloc(seq * channels * 4)
+    if norm1_out == 0 { println(" alloc failed norm1")  exit(1) }
+    i := 0
+    while i < seq {
+        layer_norm(norm1_out + i * channels * 4, hidden_states + i * channels * 4, w_n1w, w_n1b, channels)
+        i = i + 1
+    }
+    print(" norm1 done")
+    flush()
+
+    // attn1 (self-attention) — context = norm1_out
+    attn1_out := alloc(seq * channels * 4)
+    if attn1_out == 0 { println(" alloc failed attn1")  exit(1) }
+    spatial_attention(attn1_out, norm1_out, norm1_out, prefix + ".attn1", seq, channels, channels, heads)
+    free(norm1_out)
+    print(" attn1 done")
+    flush()
+
+    // h = x + attn1_out
+    h := alloc(seq * channels * 4)
+    i = 0
+    while i < seq * channels {
+        poke_f32(h, i * 4, peek_f32(hidden_states, i * 4) + peek_f32(attn1_out, i * 4))
+        i = i + 1
+    }
+    free(attn1_out)
+
+    // norm2
+    w_n2w, _ := st_tensor(prefix + ".norm2.weight")
+    w_n2b, _ := st_tensor(prefix + ".norm2.bias")
+    norm2_out := alloc(seq * channels * 4)
+    i = 0
+    while i < seq {
+        layer_norm(norm2_out + i * channels * 4, h + i * channels * 4, w_n2w, w_n2b, channels)
+        i = i + 1
+    }
+
+    // attn2 (cross-attention) — context from CLIP
+    attn2_out := alloc(seq * channels * 4)
+    spatial_attention(attn2_out, norm2_out, context, prefix + ".attn2", seq, channels, cross_dim, heads)
+    free(norm2_out)
+
+    // h = h + attn2_out
+    i = 0
+    while i < seq * channels {
+        poke_f32(h, i * 4, peek_f32(h, i * 4) + peek_f32(attn2_out, i * 4))
+        i = i + 1
+    }
+    free(attn2_out)
+
+    // norm3
+    w_n3w, _ := st_tensor(prefix + ".norm3.weight")
+    w_n3b, _ := st_tensor(prefix + ".norm3.bias")
+    norm3_out := alloc(seq * channels * 4)
+    i = 0
+    while i < seq {
+        layer_norm(norm3_out + i * channels * 4, h + i * channels * 4, w_n3w, w_n3b, channels)
+        i = i + 1
+    }
+
+    // FeedForward: GeGLU
+    // ff.net.0.proj: Linear(channels, inner * 2) → split, gate with SiLU
+    // ff.net.2: Linear(inner, channels)
+    w_ff1w, _ := st_tensor(prefix + ".ff.net.0.proj.weight")
+    w_ff1b, _ := st_tensor(prefix + ".ff.net.0.proj.bias")
+    w_ff2w, _ := st_tensor(prefix + ".ff.net.2.weight")
+    w_ff2b, _ := st_tensor(prefix + ".ff.net.2.bias")
+
+    // inner_dim = channels * 4 (but weight shape tells us)
+    // ff.net.0.proj.weight shape: [inner*2, channels] → inner*2 = 2560 for 320ch → inner=1280
+    // ff.net.2.weight shape: [channels, inner] → [320, 1280]
+    ff1_shape := st_shape(prefix + ".ff.net.0.proj.weight")
+    inner2 := ff1_shape[0]  // inner*2
+    inner := inner2 / 2
+
+    ff_hidden := alloc(seq * inner2 * 4)
+    ff_gated := alloc(seq * inner * 4)
+    // Batched ff.net.0.proj: channels → inner*2 for all seq positions
+    matmul_f32(ff_hidden, norm3_out, w_ff1w, w_ff1b, channels, inner2, seq)
+    // GeGLU: split + gate with GELU (diffusers uses F.gelu, not SiLU)
+    // GELU tanh approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    // tanh(z) = (e^(2z) - 1) / (e^(2z) + 1)
+    gelu_coeff := 0.7978845608  // sqrt(2/pi)
+    i = 0
+    while i < seq {
+        j := 0
+        while j < inner {
+            xv := peek_f32(ff_hidden, (i * inner2 + j) * 4)
+            gv := peek_f32(ff_hidden, (i * inner2 + inner + j) * 4)
+            // GELU(gate) via tanh approximation (numerically stable)
+            inner_val := gelu_coeff * (gv + 0.044715 * gv * gv * gv)
+            th := 1.0
+            if inner_val < 0.0 - 20.0 {
+                th = 0.0 - 1.0
+            } else if inner_val < 20.0 {
+                e2z := exp(2.0 * inner_val)
+                th = (e2z - 1.0) / (e2z + 1.0)  // tanh
+            }
+            gv = 0.5 * gv * (1.0 + th)
+            poke_f32(ff_gated, (i * inner + j) * 4, xv * gv)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    // Batched ff.net.2: inner → channels for all seq positions
+    matmul_f32(out, ff_gated, w_ff2w, w_ff2b, inner, channels, seq)
+    free(ff_hidden)
+    free(ff_gated)
+    free(norm3_out)
+
+    // h = h + ff_out
+    i = 0
+    while i < seq * channels {
+        poke_f32(out, i * 4, peek_f32(out, i * 4) + peek_f32(h, i * 4))
+        i = i + 1
+    }
+    free(h)
+}
+
+// ---- Attention block (UNet spatial attention with GroupNorm + proj_in/out) ----
+// Tensor names: {prefix}.norm.{weight,bias} (GroupNorm),
+//   .proj_in.{weight,bias} (Linear), .proj_out.{weight,bias} (Linear),
+//   .transformer_blocks.0.{norm1,norm2,norm3,attn1,attn2,ff...}
+//
+// input: [C, H, W] → reshape to [H*W, C] → attention → reshape back → residual
+// use_linear_projection: true (proj_in/out are Linear, not Conv2d)
+func attention_block(out, in_buf, context, prefix, channels, h, w_dim, ctx_seq, cross_dim, heads) {
+    print("    attention " + prefix + "...")
+    flush()
+    seq := h * w_dim
+
+    // GroupNorm
+    w_gn_w, _ := st_tensor(prefix + ".norm.weight")
+    w_gn_b, _ := st_tensor(prefix + ".norm.bias")
+    normed := alloc(channels * h * w_dim * 4)
+    group_norm(normed, in_buf, w_gn_w, w_gn_b, channels, h, w_dim, 32, 0.00001)
+
+    // Reshape [C, H, W] → [H*W, C] (transpose)
+    hs := alloc(seq * channels * 4)
+    y := 0
+    while y < h {
+        x := 0
+        while x < w_dim {
+            pos := y * w_dim + x
+            ci := 0
+            while ci < channels {
+                poke_f32(hs, (pos * channels + ci) * 4, peek_f32(normed, (ci * h * w_dim + y * w_dim + x) * 4))
+                ci = ci + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    free(normed)
+
+    // proj_in (batched Linear: channels → channels for all seq positions)
+    w_pin_w, _ := st_tensor(prefix + ".proj_in.weight")
+    w_pin_b, _ := st_tensor(prefix + ".proj_in.bias")
+    proj_in_out := alloc(seq * channels * 4)
+    matmul_f32(proj_in_out, hs, w_pin_w, w_pin_b, channels, channels, seq)
+    free(hs)
+
+    // Transformer block (only 1 layer per block for SD-Turbo)
+    tb_out := alloc(seq * channels * 4)
+    transformer_block(tb_out, proj_in_out, context, prefix + ".transformer_blocks.0", seq, channels, ctx_seq, cross_dim, heads)
+    free(proj_in_out)
+
+    // proj_out (batched Linear: channels → channels for all seq positions)
+    w_pout_w, _ := st_tensor(prefix + ".proj_out.weight")
+    w_pout_b, _ := st_tensor(prefix + ".proj_out.bias")
+    proj_out_out := alloc(seq * channels * 4)
+    matmul_f32(proj_out_out, tb_out, w_pout_w, w_pout_b, channels, channels, seq)
+    free(tb_out)
+
+    // Reshape [H*W, C] → [C, H, W] (transpose back) and add residual
+    y = 0
+    while y < h {
+        x = 0
+        while x < w_dim {
+            pos := y * w_dim + x
+            ci = 0
+            while ci < channels {
+                idx := (ci * h * w_dim + y * w_dim + x) * 4
+                poke_f32(out, idx, peek_f32(in_buf, idx) + peek_f32(proj_out_out, (pos * channels + ci) * 4))
+                ci = ci + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    free(proj_out_out)
+    println(" done")
+    flush()
+}

@@ -1,23 +1,87 @@
 // main.src — machin-diffusion entry point
-// Usage: machin-diffusion <model_dir> <token_ids_file>
-// token_ids_file: one integer per line (BOS + tokens + EOS, padded to 77)
-// Use scripts/tokenize.py to generate the token IDs file from a prompt.
-
-// ---- main ----
+// Usage: machin-diffusion <model_dir> <token_ids_file> [output.ppm]
+// Full pipeline: CLIP → UNet (1-step) → VAE → PPM image
 
 func main() {
     argv := args()
     if len(argv) < 3 {
-        println("usage: machin-diffusion <model_dir> <token_ids_file>")
-        println("  model_dir contains text_encoder/model.safetensors[.idx]")
+        println("usage: machin-diffusion <model_dir> <token_ids_file> [output.ppm]")
+        println("  model_dir contains text_encoder/, unet/, vae/ (with .safetensors + .idx)")
         println("  token_ids_file: one int per line (use scripts/tokenize.py)")
         exit(1)
     }
 
     modelDir := argv[1]
     tokensPath := argv[2]
+    outPath := "output.ppm"
+    if len(argv) > 3 { outPath = argv[3] }
+
+    // Normalize path separators
+    modelDir = replace(modelDir, "\\", "/")
 
     println("machin-diffusion — SD-Turbo in pure MFL")
+    println("model: " + modelDir)
+    flush()
+
+    // Initialize OpenCL GPU backend (Windows only, falls back to CPU)
+    gpu := ocl_init()
+    if gpu == 1 {
+        println("GPU: OpenCL initialized (RX 6600)")
+    } else {
+        println("GPU: not available, using CPU")
+    }
+    flush()
+
+    // GPU kernel smoke test: conv2d and matmul with known inputs
+    if gpu == 1 {
+        println("=== GPU smoke test ===")
+        // Test matmul: [1,4] @ [4,3] + bias[3] = [1,3]
+        // x = [1, 2, 3, 4], w = [[1,0,0,0],[0,1,0,0],[0,0,1,0]], b = [10, 20, 30]
+        // expected: [11, 22, 33]
+        mt_x := alloc(4 * 4)
+        poke_f32(mt_x, 0, 1.0)
+        poke_f32(mt_x, 4, 2.0)
+        poke_f32(mt_x, 8, 3.0)
+        poke_f32(mt_x, 12, 4.0)
+        mt_w := alloc(12 * 4)
+        // w is row-major [out, in]: w[o*in + k]. Identity-like: w[0][0]=1, w[1][1]=1, w[2][2]=1
+        // float indices 0, 5, 10 → byte offsets 0, 20, 40
+        poke_f32(mt_w, 0, 1.0)
+        poke_f32(mt_w, 20, 1.0)
+        poke_f32(mt_w, 40, 1.0)
+        mt_b := alloc(3 * 4)
+        poke_f32(mt_b, 0, 10.0)
+        poke_f32(mt_b, 4, 20.0)
+        poke_f32(mt_b, 8, 30.0)
+        mt_out := alloc(3 * 4)
+        matmul_f32(mt_out, mt_x, mt_w, mt_b, 4, 3, 1)
+        r0 := peek_f32(mt_out, 0)
+        r1 := peek_f32(mt_out, 4)
+        r2 := peek_f32(mt_out, 8)
+        println("  matmul test: " + str(r0) + " " + str(r1) + " " + str(r2) + " (expect 11 22 33)")
+        // Test conv2d: 1 channel, 1 output, 3x3 kernel, pad=1
+        // in[0,0]=1, rest=0. kernel center [1,1]=1 (weight[4]). bias=0.
+        // With pad=1, output(0,0) center maps to input(0,0). Expected: out[0,0]=1
+        cv_in := alloc(9 * 4)
+        i := 0
+        while i < 9 { poke_f32(cv_in, i * 4, 0.0)  i = i + 1 }
+        poke_f32(cv_in, 0, 1.0)
+        cv_w := alloc(9 * 4)
+        i = 0
+        while i < 9 { poke_f32(cv_w, i * 4, 0.0)  i = i + 1 }
+        poke_f32(cv_w, 16, 1.0)  // weight[4] = kernel center [ky=1,kx=1]
+        cv_b := alloc(1 * 4)
+        poke_f32(cv_b, 0, 0.0)
+        cv_out := alloc(9 * 4)
+        conv2d_f32(cv_out, cv_in, cv_w, cv_b, 1, 1, 3, 3, 3, 3, 1, 1)
+        cv0 := peek_f32(cv_out, 0)
+        cv4 := peek_f32(cv_out, 4)
+        cv8 := peek_f32(cv_out, 8)
+        println("  conv2d test: " + str(cv0) + " " + str(cv4) + " " + str(cv8) + " (expect 1 0 0)")
+        free(mt_x)  free(mt_w)  free(mt_b)  free(mt_out)
+        free(cv_in)  free(cv_w)  free(cv_b)  free(cv_out)
+        flush()
+    }
 
     // 1. Read token IDs
     tokenText := read_file(tokensPath)
@@ -28,45 +92,159 @@ func main() {
         if len(line) == 0 { continue }
         token_ids = append(token_ids, parse_int(line))
     }
-
-    // Find seq length (up to EOS or end of non-pad tokens)
     seq := len(token_ids)
     if seq > clip_max_pos { seq = clip_max_pos }
     println("tokens: " + str(seq))
 
-    // 2. Load CLIP text encoder weights
-    println("loading text encoder...")
-    // Normalize path separators (Windows passes backslashes, MFL uses forward slashes)
-    modelDir = replace(modelDir, "\\", "/")
+    // 2. Load CLIP text encoder
+    println("=== CLIP text encoder ===")
     st_open(modelDir + "/text_encoder/model.safetensors")
     clip_load()
     clip_alloc()
-
-    // 3. Run CLIP forward pass
-    println("running CLIP forward pass...")
     clip_forward(token_ids, seq)
+    // clip_x now has [77, 1024] text embeddings
+    // Copy to a persistent buffer before switching safetensors files
+    clip_emb := alloc(77 * clip_hidden * 4)
+    copy_buf(clip_emb, clip_x, 77 * clip_hidden)
+    println("CLIP done: " + str(seq) + " x " + str(clip_hidden))
+    flush()
 
-    // 4. Print output stats (for verification)
-    println("CLIP output: " + str(seq) + " x " + str(clip_hidden))
-    // Print first few values of the first token's embedding
-    print("embedding[0][:5]:")
+    // Debug: CLIP embedding stats
+    clip_min := 1e30
+    clip_max := 0.0 - 1e30
+    clip_sum := 0.0
+    ci := 0
+    while ci < 77 * clip_hidden {
+        cv := peek_f32(clip_emb, ci * 4)
+        if cv < clip_min { clip_min = cv }
+        if cv > clip_max { clip_max = cv }
+        clip_sum = clip_sum + cv
+        ci = ci + 1
+    }
+    println("CLIP emb stats: min=" + str(clip_min) + " max=" + str(clip_max) + " mean=" + str(clip_sum / float(77 * clip_hidden)))
+    // Check first token (BOS) and prompt token (cat)
+    bos0 := peek_f32(clip_emb, 0)
+    cat0 := peek_f32(clip_emb, 1 * clip_hidden * 4)
+    println("CLIP BOS[0]=" + str(bos0) + " cat[0]=" + str(cat0))
+    flush()
+
+    // Dump CLIP embeddings for comparison with reference
+    write_file_raw(modelDir + "/clip_emb_mfl.bin", clip_emb, 77 * clip_hidden * 4)
+    println("dumped clip_emb_mfl.bin")
+    flush()
+
+    // Free CLIP model memory before loading UNet (saves ~1.36GB)
+    st_close()
+    println("freed CLIP model memory")
+    flush()
+
+    // 3. Generate random latent noise
+    println("=== Generating noise ===")
+    latent := alloc(4 * 64 * 64 * 4)
+    generate_noise(latent, 4 * 64 * 64)
+    // EulerDiscreteScheduler 1-step SD-Turbo (trailing spacing):
+    //   init_noise_sigma = sigma_max = 14.6146 (NOT sqrt(s^2+1) — that's leading)
+    init_noise_sigma := 14.6146
     i := 0
-    while i < 5 {
-        print(" " + str(peek_f32(clip_x, i * 4)))
+    while i < 4 * 64 * 64 {
+        v := peek_f32(latent, i * 4)
+        poke_f32(latent, i * 4, v * init_noise_sigma)
         i = i + 1
     }
-    println("")
+    // Dump initial latent (noise * init_noise_sigma) for comparison with reference
+    write_file_raw(modelDir + "/latent_init_mfl.bin", latent, 4 * 64 * 64 * 4)
+    println("dumped latent_init_mfl.bin")
+    flush()
 
-    // Print embedding norm (sanity check — should be nonzero)
-    norm := 0.0
+    // 4. UNet forward pass (1-step SD-Turbo trailing: timestep=999, sigma=14.6146)
+    // scale_model_input: sample /= sqrt(sigma^2 + 1) — EulerDiscreteScheduler
+    println("=== UNet forward pass ===")
+    flush()
+    sigma := 14.6146
+    scale_in := 1.0 / sqrt(sigma * sigma + 1.0)
+    unet_input := alloc(4 * 64 * 64 * 4)
     i = 0
-    while i < clip_hidden {
-        v := peek_f32(clip_x, i * 4)
-        norm = norm + v * v
+    while i < 4 * 64 * 64 {
+        poke_f32(unet_input, i * 4, peek_f32(latent, i * 4) * scale_in)
         i = i + 1
     }
-    println("embedding[0] norm: " + str(sqrt(norm)))
+    flush()
+    st_open(modelDir + "/unet/diffusion_pytorch_model.safetensors")
+    flush()
+    noise_pred := unet_forward(unet_input, clip_emb, 999)
+    free(unet_input)
+    println("UNet done")
+    flush()
 
-    // TODO: UNet forward pass + VAE decode + image output
-    println("CLIP text encoder complete. UNet + VAE not yet implemented.")
+    // Debug: print noise_pred statistics
+    npmin := 1e30
+    npmax := 0.0 - 1e30
+    npsum := 0.0
+    npi := 0
+    while npi < 4 * 64 * 64 {
+        npv := peek_f32(noise_pred, npi * 4)
+        if npv < npmin { npmin = npv }
+        if npv > npmax { npmax = npv }
+        npsum = npsum + npv
+        npi = npi + 1
+    }
+    println("noise_pred stats: min=" + str(npmin) + " max=" + str(npmax) + " mean=" + str(npsum / float(4 * 64 * 64)))
+    flush()
+
+    // Dump noise_pred for comparison with reference
+    write_file_raw(modelDir + "/noise_pred_mfl.bin", noise_pred, 4 * 64 * 64 * 4)
+    println("dumped noise_pred_mfl.bin")
+    flush()
+
+    // Free UNet model memory before loading VAE (saves ~3.46GB)
+    st_close()
+    println("freed UNet model memory")
+    flush()
+
+    // 5. Euler step (denoise)
+    println("=== Scheduler step ===")
+    // SD-Turbo 1-step: sigma=0.0413 (from EulerDiscreteScheduler with 1 step)
+    euler_step(latent, noise_pred, sigma, 4 * 64 * 64)
+    free(noise_pred)
+
+    // Debug: print latent statistics after euler step
+    lmin := 1e30
+    lmax := 0.0 - 1e30
+    lsum := 0.0
+    labs_sum := 0.0
+    li := 0
+    while li < 4 * 64 * 64 {
+        lv := peek_f32(latent, li * 4)
+        if lv < lmin { lmin = lv }
+        if lv > lmax { lmax = lv }
+        lsum = lsum + lv
+        labs_sum = labs_sum + abs(lv)
+        li = li + 1
+    }
+    println("latent stats: min=" + str(lmin) + " max=" + str(lmax) + " mean=" + str(lsum / float(4 * 64 * 64)) + " abs_mean=" + str(labs_sum / float(4 * 64 * 64)))
+    flush()
+
+    // Dump final latent for comparison with reference
+    write_file_raw(modelDir + "/latent_final_mfl.bin", latent, 4 * 64 * 64 * 4)
+    println("dumped latent_final_mfl.bin")
+    flush()
+
+    // 6. VAE decode
+    println("=== VAE decode ===")
+    flush()
+    st_open(modelDir + "/vae/diffusion_pytorch_model.safetensors")
+    image := vae_decode(latent)
+    free(latent)
+    println("VAE done")
+    flush()
+
+    // 7. Write PPM image
+    println("=== Writing image ===")
+    flush()
+    write_ppm(outPath, image, 512, 512)
+    free(image)
+
+    println("=== Complete! ===")
+    println("Output: " + outPath)
+    flush()
 }

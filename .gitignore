@@ -6,3 +6,17 @@ token_ids.txt
 *.safetensors
 *.safetensors.idx
 *.pdb
+# Debug output images (keep docs/ proof images only)
+output.png
+output.ppm
+output2.ppm
+output_clip.png
+output_eps.png
+output_gpu.png
+output_v3.png
+output_causal.png
+# Temp dumps
+*_mfl.bin
+*.b64
+output_v4.png
+output_vae.png

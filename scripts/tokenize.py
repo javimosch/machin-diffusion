@@ -93,9 +93,10 @@ def main():
                 tokens.append(encoder[w])
 
     tokens.append(eos)
-    # Pad to max_len
+    # Pad to max_len with pad_token_id (0 for OpenCLIP/SD 2.x, NOT eos)
+    pad_id = 0
     while len(tokens) < max_len:
-        tokens.append(eos)
+        tokens.append(pad_id)
     tokens = tokens[:max_len]
 
     with open(out_path, "w") as f:

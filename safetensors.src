@@ -6,6 +6,21 @@
 // ---- safetensors state ----
 var st_buf = 0        // mmap pointer to the safetensors file
 var st_data_base = 0  // byte offset where tensor data starts (= 8 + header_len)
+var st_buf_owned = 0  // 1 if we allocated (Windows fallback), 0 if mmap'd (POSIX)
+
+// Free the current safetensors buffer (for Windows fallback only)
+func st_close() {
+    if st_buf_owned == 1 && st_buf != 0 {
+        free(st_buf)
+    }
+    st_buf = 0
+    st_data_base = 0
+    st_buf_owned = 0
+    // Clear index
+    st_index = []TensorIdx{}
+    // Clear map
+    for k := range st_index_map { delete(st_index_map, k) }
+}
 
 // Tensor index entry (parsed from .idx file)
 type TensorIdx struct {
@@ -68,24 +83,30 @@ func st_open(path) {
     p, n := mmap_file(path)
     if p != 0 {
         st_buf = p
+        st_buf_owned = 0
+        println("  mmap ok: " + str(n) + " bytes")
     } else {
         // Windows fallback: read the entire file into memory
-        // First read the 8-byte header to get header length
-        hdr := alloc(8)
-        read_file_raw(path, hdr, 8)
-        hlen := read_u64_ptr(hdr, 0)
-        free(hdr)
-        totalSize := 8 + hlen
+        println("  mmap failed, reading file into memory...")
         // Find total file size from the last tensor's end offset
         maxEnd := 0
         for _, entry := range st_index {
             if entry.end > maxEnd { maxEnd = entry.end }
         }
-        totalSize = 8 + hlen + maxEnd
-        // Allocate and read the whole file
+        // Read 8-byte header to get header length
+        hdr := alloc(8)
+        read_file_raw(path, hdr, 8)
+        hlen2 := read_u64_ptr(hdr, 0)
+        free(hdr)
+        totalSize := 8 + hlen2 + maxEnd
+        println("  allocating " + str(totalSize) + " bytes...")
         st_buf = alloc(totalSize)
+        if st_buf == 0 { println("st_open: alloc failed for " + path)  exit(1) }
+        st_buf_owned = 1
+        println("  reading file...")
         got := read_file_raw(path, st_buf, totalSize)
         if got < 0 { println("st_open: cannot read " + path)  exit(1) }
+        println("  read " + str(got) + " bytes")
     }
 
     // Read the actual header length to compute data base

@@ -171,14 +171,20 @@ func layer_norm(out, x, w, b, n) {
     }
 }
 
-// GELU activation (tanh approximation, same as CLIP uses)
+// GELU activation (quick_gelu: x * sigmoid(1.702 * x))
+// SD-Turbo CLIP uses quick_gelu, NOT the tanh approximation.
 func gelu(x) (r) {
-    c := 0.7978845608028654 * (x + 0.044715 * x * x * x)
-    r = 0.5 * x * (1.0 + tanh_approx(c))
+    z := 1.702 * x
+    if z > 20.0 { r = x  return }
+    if z < 0.0 - 20.0 { r = 0.0  return }
+    r = x / (1.0 + exp(0.0 - z))
     return
 }
 
 func tanh_approx(x) (r) {
+    // Numerically stable: tanh saturates to ±1 for |x| > ~20
+    if x > 20.0 { r = 1.0  return }
+    if x < 0.0 - 20.0 { r = 0.0 - 1.0  return }
     e := exp(2.0 * x)
     r = (e - 1.0) / (e + 1.0)
     return
@@ -186,38 +192,14 @@ func tanh_approx(x) (r) {
 
 // Linear layer: out = W * x + b
 // W: [out_n, in_n] fp32 (row-major), x: [in_n] fp32, b: [out_n] fp32, out: [out_n] fp32
-// W is stored as [out_n, in_n] in safetensors (PyTorch nn.Linear weight layout)
+// Uses native matmul_f32 (batch=1) for vectorized C speed.
 func linear(out, w, b, x, in_n, out_n) {
-    o := 0
-    while o < out_n {
-        // dot(W[o,:], x[:])
-        sum := 0.0
-        i := 0
-        while i < in_n {
-            sum = sum + peek_f32(w, (o * in_n + i) * 4) * peek_f32(x, i * 4)
-            i = i + 1
-        }
-        if b != 0 {
-            sum = sum + peek_f32(b, o * 4)
-        }
-        poke_f32(out, o * 4, sum)
-        o = o + 1
-    }
+    matmul_f32(out, x, w, b, in_n, out_n, 1)
 }
 
 // Linear layer without bias (b = 0)
 func linear_no_bias(out, w, x, in_n, out_n) {
-    o := 0
-    while o < out_n {
-        sum := 0.0
-        i := 0
-        while i < in_n {
-            sum = sum + peek_f32(w, (o * in_n + i) * 4) * peek_f32(x, i * 4)
-            i = i + 1
-        }
-        poke_f32(out, o * 4, sum)
-        o = o + 1
-    }
+    matmul_f32(out, x, w, 0, in_n, out_n, 1)
 }
 
 // Scaled dot-product attention with causal mask
@@ -233,47 +215,44 @@ func attention_head(out_buf, q_buf, k_buf, v_buf, seq, head) {
     hd := clip_head_dim
     scale := 1.0 / sqrt(float(hd))
     q_off := head * hd  // offset into hidden dim for this head
-    // For each query position i
+    // CAUSAL: position i attends only to positions 0..i
     i := 0
     while i < seq {
-        // Compute attention scores for position i over ALL positions (bidirectional)
         scores := clip_att + (i * clip_n_heads * clip_max_pos + head * clip_max_pos) * 4
-        // Compute max for numerical stability
         mx := 0.0 - 1e30
+        cutoff := i + 1
         j := 0
-        while j < seq {
-            // dot(Q[i, q_off:q_off+hd], K[j, q_off:q_off+hd])
-            dot := 0.0
-            d := 0
-            while d < hd {
-                dot = dot + peek_f32(q_buf, (i * clip_hidden + q_off + d) * 4) * peek_f32(k_buf, (j * clip_hidden + q_off + d) * 4)
-                d = d + 1
-            }
+        while j < cutoff {
+            dot := dot_f32(q_buf + (i * clip_hidden + q_off) * 4, k_buf + (j * clip_hidden + q_off) * 4, hd)
             dot = dot * scale
             poke_f32(scores, j * 4, dot)
             if dot > mx { mx = dot }
             j = j + 1
         }
-        // Softmax over all positions
         sum := 0.0
         j = 0
-        while j < seq {
+        while j < cutoff {
             e := exp(peek_f32(scores, j * 4) - mx)
             poke_f32(scores, j * 4, e)
             sum = sum + e
             j = j + 1
         }
-        // Weighted sum of V
-        d = 0
+        inv_sum := 1.0 / sum
+        j = 0
+        while j < cutoff {
+            poke_f32(scores, j * 4, peek_f32(scores, j * 4) * inv_sum)
+            j = j + 1
+        }
+        d := 0
         while d < hd {
-            acc := 0.0
-            j = 0
-            while j < seq {
-                acc = acc + peek_f32(scores, j * 4) * peek_f32(v_buf, (j * clip_hidden + q_off + d) * 4)
-                j = j + 1
-            }
-            poke_f32(out_buf, (i * clip_hidden + q_off + d) * 4, acc)
+            poke_f32(out_buf, (i * clip_hidden + q_off + d) * 4, 0.0)
             d = d + 1
+        }
+        j = 0
+        while j < cutoff {
+            s := peek_f32(scores, j * 4)
+            axpy_f32(out_buf + (i * clip_hidden + q_off) * 4, s, v_buf + (j * clip_hidden + q_off) * 4, hd)
+            j = j + 1
         }
         i = i + 1
     }
@@ -369,7 +348,6 @@ func clip_forward(token_ids, seq) {
             free(proj_out)
             pos = pos + 1
         }
-
         // --- MLP block ---
         pos = 0
         while pos < seq {

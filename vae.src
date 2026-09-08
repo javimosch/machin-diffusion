@@ -1,0 +1,271 @@
+// vae.src — VAE decoder for SD-Turbo
+// Decodes latent [4, 64, 64] → image [3, 512, 512]
+// Architecture: post_quant_conv → conv_in → mid_block (resnet+attn+resnet)
+//   → 4 up_blocks (3 with upsamplers) → conv_norm_out → conv_out
+
+// VAE decoder config
+var vae_channels = []int{512, 512, 256, 128}  // up block output channels
+
+// Simple self-attention for VAE mid_block (single-head, with bias on QKV)
+func vae_attention(out, in_buf, prefix, channels, h, w_dim) {
+    seq := h * w_dim
+
+    // GroupNorm
+    w_gn_w, _ := st_tensor(prefix + ".group_norm.weight")
+    w_gn_b, _ := st_tensor(prefix + ".group_norm.bias")
+    normed := alloc(channels * h * w_dim * 4)
+    group_norm(normed, in_buf, w_gn_w, w_gn_b, channels, h, w_dim, 32, 0.000001)
+
+    // Reshape [C, H, W] → [H*W, C]
+    hs := alloc(seq * channels * 4)
+    y := 0
+    while y < h {
+        x := 0
+        while x < w_dim {
+            pos := y * w_dim + x
+            ci := 0
+            while ci < channels {
+                poke_f32(hs, (pos * channels + ci) * 4, peek_f32(normed, (ci * h * w_dim + y * w_dim + x) * 4))
+                ci = ci + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    free(normed)
+
+    // Q, K, V (with bias)
+    w_q, _ := st_tensor(prefix + ".to_q.weight")
+    b_q, _ := st_tensor(prefix + ".to_q.bias")
+    w_k, _ := st_tensor(prefix + ".to_k.weight")
+    b_k, _ := st_tensor(prefix + ".to_k.bias")
+    w_v, _ := st_tensor(prefix + ".to_v.weight")
+    b_v, _ := st_tensor(prefix + ".to_v.bias")
+
+    q := alloc(seq * channels * 4)
+    k := alloc(seq * channels * 4)
+    v := alloc(seq * channels * 4)
+    // Batched QKV projections
+    matmul_f32(q, hs, w_q, b_q, channels, channels, seq)
+    matmul_f32(k, hs, w_k, b_k, channels, channels, seq)
+    matmul_f32(v, hs, w_v, b_v, channels, channels, seq)
+    free(hs)
+
+    // Single-head attention — native dot_f32 + axpy_f32
+    scale := 1.0 / sqrt(float(channels))
+    attn_out := alloc(seq * channels * 4)
+    scores := alloc(seq * 4)
+
+    i := 0
+    while i < seq {
+        mx := 0.0 - 1e30
+        j := 0
+        while j < seq {
+            dot := dot_f32(q + i * channels * 4, k + j * channels * 4, channels)
+            dot = dot * scale
+            poke_f32(scores, j * 4, dot)
+            if dot > mx { mx = dot }
+            j = j + 1
+        }
+        sum := 0.0
+        j = 0
+        while j < seq {
+            e := exp(peek_f32(scores, j * 4) - mx)
+            poke_f32(scores, j * 4, e)
+            sum = sum + e
+            j = j + 1
+        }
+        // Normalize by sum (softmax)
+        inv_sum := 1.0 / sum
+        j = 0
+        while j < seq {
+            poke_f32(scores, j * 4, peek_f32(scores, j * 4) * inv_sum)
+            j = j + 1
+        }
+        // Zero output row, then accumulate with axpy_f32
+        d := 0
+        while d < channels {
+            poke_f32(attn_out, (i * channels + d) * 4, 0.0)
+            d = d + 1
+        }
+        j = 0
+        while j < seq {
+            s := peek_f32(scores, j * 4)
+            axpy_f32(attn_out + i * channels * 4, s, v + j * channels * 4, channels)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    free(q)
+    free(k)
+    free(v)
+    free(scores)
+
+    // Output projection (batched)
+    w_out, _ := st_tensor(prefix + ".to_out.0.weight")
+    b_out, _ := st_tensor(prefix + ".to_out.0.bias")
+    proj_out := alloc(seq * channels * 4)
+    matmul_f32(proj_out, attn_out, w_out, b_out, channels, channels, seq)
+    free(attn_out)
+
+    // Reshape back [H*W, C] → [C, H, W] and add residual
+    y = 0
+    while y < h {
+        x = 0
+        while x < w_dim {
+            pos := y * w_dim + x
+            ci = 0
+            while ci < channels {
+                idx := (ci * h * w_dim + y * w_dim + x) * 4
+                poke_f32(out, idx, peek_f32(in_buf, idx) + peek_f32(proj_out, (pos * channels + ci) * 4))
+                ci = ci + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    free(proj_out)
+}
+
+// VAE ResNet block (no time embedding, just norm→SiLU→conv→norm→SiLU→conv→residual)
+func vae_resnet_block(out, in_buf, prefix, in_ch, out_ch, h, w_dim) {
+    tmp := alloc(in_ch * h * w_dim * 4)
+
+    // norm1
+    w_n1w, _ := st_tensor(prefix + ".norm1.weight")
+    w_n1b, _ := st_tensor(prefix + ".norm1.bias")
+    group_norm(tmp, in_buf, w_n1w, w_n1b, in_ch, h, w_dim, 32, 0.000001)
+    silu_buf(tmp, in_ch * h * w_dim)
+
+    // conv1: in_ch → out_ch
+    w_c1w, _ := st_tensor(prefix + ".conv1.weight")
+    w_c1b, _ := st_tensor(prefix + ".conv1.bias")
+    conv2d(out, tmp, w_c1w, w_c1b, in_ch, out_ch, h, w_dim, 3, 3, 1, 1)
+    free(tmp)
+
+    // norm2
+    tmp2 := alloc(out_ch * h * w_dim * 4)
+    w_n2w, _ := st_tensor(prefix + ".norm2.weight")
+    w_n2b, _ := st_tensor(prefix + ".norm2.bias")
+    group_norm(tmp2, out, w_n2w, w_n2b, out_ch, h, w_dim, 32, 0.000001)
+    silu_buf(tmp2, out_ch * h * w_dim)
+
+    // conv2: out_ch → out_ch
+    w_c2w, _ := st_tensor(prefix + ".conv2.weight")
+    w_c2b, _ := st_tensor(prefix + ".conv2.bias")
+    conv2d(out, tmp2, w_c2w, w_c2b, out_ch, out_ch, h, w_dim, 3, 3, 1, 1)
+    free(tmp2)
+
+    // Residual (with shortcut if channels differ)
+    if in_ch != out_ch {
+        w_sc_w, _ := st_tensor(prefix + ".conv_shortcut.weight")
+        w_sc_b, _ := st_tensor(prefix + ".conv_shortcut.bias")
+        shortcut := alloc(out_ch * h * w_dim * 4)
+        conv2d(shortcut, in_buf, w_sc_w, w_sc_b, in_ch, out_ch, h, w_dim, 1, 1, 0, 1)
+        add_buf(out, shortcut, out_ch * h * w_dim)
+        free(shortcut)
+    } else {
+        add_buf(out, in_buf, out_ch * h * w_dim)
+    }
+}
+
+// VAE decoder forward pass
+// latent: [4, 64, 64] → image: [3, 512, 512]
+func vae_decode(latent) (image) {
+    h := 64
+    w := 64
+
+    // post_quant_conv: Conv2d(4, 4, 1)
+    w_pqc_w, _ := st_tensor("post_quant_conv.weight")
+    w_pqc_b, _ := st_tensor("post_quant_conv.bias")
+    x := alloc(4 * h * w * 4)
+    conv2d(x, latent, w_pqc_w, w_pqc_b, 4, 4, h, w, 1, 1, 0, 1)
+
+    // decoder.conv_in: Conv2d(4, 512, 3, pad=1)
+    w_cin_w, _ := st_tensor("decoder.conv_in.weight")
+    w_cin_b, _ := st_tensor("decoder.conv_in.bias")
+    x2 := alloc(512 * h * w * 4)
+    conv2d(x2, x, w_cin_w, w_cin_b, 4, 512, h, w, 3, 3, 1, 1)
+    free(x)
+    x = x2
+
+    // mid_block: resnet_0 + attention + resnet_1
+    println("  vae mid_block...")
+    flush()
+    mid0 := alloc(512 * h * w * 4)
+    vae_resnet_block(mid0, x, "decoder.mid_block.resnets.0", 512, 512, h, w)
+    free(x)
+    x = mid0
+
+    mid_att := alloc(512 * h * w * 4)
+    vae_attention(mid_att, x, "decoder.mid_block.attentions.0", 512, h, w)
+    free(x)
+    x = mid_att
+
+    mid1 := alloc(512 * h * w * 4)
+    vae_resnet_block(mid1, x, "decoder.mid_block.resnets.1", 512, 512, h, w)
+    free(x)
+    x = mid1
+    println("  vae mid_block done")
+    flush()
+
+    // up_blocks: 0(512→512, up), 1(512→512, up), 2(512→256, up), 3(256→128, no up)
+    ub := 0
+    while ub < 4 {
+        println("  vae up_block " + str(ub) + " (h=" + str(h) + ")")
+        flush()
+        out_ch := vae_channels[ub]
+        in_ch := 0
+        if ub == 0 { in_ch = 512 }
+        if ub == 1 { in_ch = 512 }
+        if ub == 2 { in_ch = 512 }
+        if ub == 3 { in_ch = 256 }
+
+        // 3 resnets per up block
+        l := 0
+        while l < 3 {
+            // First resnet may change channels
+            r_in := in_ch
+            if l > 0 { r_in = out_ch }
+            res_out := alloc(out_ch * h * w * 4)
+            vae_resnet_block(res_out, x, "decoder.up_blocks." + str(ub) + ".resnets." + str(l), r_in, out_ch, h, w)
+            free(x)
+            x = res_out
+            l = l + 1
+        }
+
+        // Upsampler (except last block)
+        if ub < 3 {
+            up_h := h * 2
+            up_w := w * 2
+            upsampled := alloc(out_ch * up_h * up_w * 4)
+            upsample_nearest(upsampled, x, out_ch, h, w)
+            w_up_w, _ := st_tensor("decoder.up_blocks." + str(ub) + ".upsamplers.0.conv.weight")
+            w_up_b, _ := st_tensor("decoder.up_blocks." + str(ub) + ".upsamplers.0.conv.bias")
+            up_out := alloc(out_ch * up_h * up_w * 4)
+            conv2d(up_out, upsampled, w_up_w, w_up_b, out_ch, out_ch, up_h, up_w, 3, 3, 1, 1)
+            free(upsampled)
+            free(x)
+            x = up_out
+            h = up_h
+            w = up_w
+        }
+        ub = ub + 1
+    }
+
+    // conv_norm_out: GroupNorm(32, 128) + SiLU
+    w_cno_w, _ := st_tensor("decoder.conv_norm_out.weight")
+    w_cno_b, _ := st_tensor("decoder.conv_norm_out.bias")
+    normed := alloc(128 * h * w * 4)
+    group_norm(normed, x, w_cno_w, w_cno_b, 128, h, w, 32, 0.000001)
+    silu_buf(normed, 128 * h * w)
+    free(x)
+
+    // conv_out: Conv2d(128, 3, 3, pad=1)
+    w_cout_w, _ := st_tensor("decoder.conv_out.weight")
+    w_cout_b, _ := st_tensor("decoder.conv_out.bias")
+    image = alloc(3 * h * w * 4)
+    conv2d(image, normed, w_cout_w, w_cout_b, 128, 3, h, w, 3, 3, 1, 1)
+    free(normed)
+    return
+}

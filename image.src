@@ -1,0 +1,94 @@
+// image.src — PPM image output + noise generation + scheduler
+
+// Write a PPM (P6) image file
+// image: [3, H, W] fp32 in range [-1, 1] (SD VAE output, converted to [0,1] then 0-255)
+func write_ppm(path, image, h, w_dim) {
+    // PPM header: "P6\n{width} {height}\n255\n" + raw RGB bytes
+    header := "P6\n" + str(w_dim) + " " + str(h) + "\n255\n"
+    // Build the file content as bytes
+    buf := alloc(h * w_dim * 3 + 100)
+    // Write header
+    hb := bytes(header)
+    pos := 0
+    i := 0
+    while i < len(hb) {
+        poke_u8(buf, pos, byte_at(hb, i))
+        pos = pos + 1
+        i = i + 1
+    }
+    // Write pixel data (RGB interleaved)
+    // VAE outputs [-1, 1]; convert to [0, 1]: val = (val + 1) / 2
+    y := 0
+    while y < h {
+        x := 0
+        while x < w_dim {
+            c := 0
+            while c < 3 {
+                val := peek_f32(image, (c * h * w_dim + y * w_dim + x) * 4)
+                // Convert from [-1, 1] to [0, 1]
+                val = (val + 1.0) * 0.5
+                // Clamp to [0, 1] and scale to [0, 255]
+                if val < 0.0 { val = 0.0 }
+                if val > 1.0 { val = 1.0 }
+                poke_u8(buf, pos, int(val * 255.0))
+                pos = pos + 1
+                c = c + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    // Write to file using write_file_raw
+    write_file_raw(path, buf, pos)
+    free(buf)
+    println("wrote " + str(w_dim) + "x" + str(h) + " PPM image to " + path)
+}
+
+// Simple deterministic PRNG (xorshift64) for noise generation
+var rng_state = 12345
+
+func rng_next() (r) {
+    rng_state = rng_state ^ (rng_state << 13)
+    rng_state = rng_state ^ (rng_state >> 7)
+    rng_state = rng_state ^ (rng_state << 17)
+    r = rng_state
+    return
+}
+
+// Generate standard normal noise using Box-Muller transform
+func rand_normal() (r) {
+    u1 := float(rng_next() & 0x7FFFFFFF) / float(0x7FFFFFFF)
+    if u1 < 0.0001 { u1 = 0.0001 }
+    u2 := float(rng_next() & 0x7FFFFFFF) / float(0x7FFFFFFF)
+    // Box-Muller: sqrt(-2*ln(u1)) * cos(2*pi*u2)
+    mag := sqrt(0.0 - 2.0 * log(u1))
+    r = mag * cos(2.0 * 3.141592653589793 * u2)
+    return
+}
+
+// Generate random latent noise [4, 64, 64]
+func generate_noise(latent, n) {
+    i := 0
+    while i < n {
+        poke_f32(latent, i * 4, rand_normal())
+        i = i + 1
+    }
+}
+
+// Euler discrete scheduler for 1-step SD-Turbo
+// SD-Turbo config has prediction_type NOT SET = defaults to "epsilon"
+// For epsilon: x0 = sample - sigma * eps_pred
+// Then scale by VAE scaling factor (0.18215) before VAE decode
+func euler_step(sample, noise_pred, sigma, n) {
+    scale_factor := 0.18215
+    i := 0
+    while i < n {
+        s := peek_f32(sample, i * 4)
+        eps := peek_f32(noise_pred, i * 4)
+        // epsilon prediction: x0 = sample - sigma * eps
+        x0 := s - sigma * eps
+        // Scale (VAE expects latent / scale_factor)
+        poke_f32(sample, i * 4, x0 / scale_factor)
+        i = i + 1
+    }
+}

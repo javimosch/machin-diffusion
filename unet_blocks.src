@@ -139,54 +139,12 @@ func spatial_attention(out, hidden_states, context, prefix, seq, channels, ctx_d
     matmul_f32(k, context, w_k, 0, ctx_dim, channels, ctx_seq)
     matmul_f32(v, context, w_v, 0, ctx_dim, channels, ctx_seq)
 
-    // Multi-head attention — uses native dot_f32 for scores, axpy_f32 for V accumulation
+    // Multi-head attention — fused GPU kernel (flash-attention-lite)
     attn_out := alloc(seq * channels * 4)
     zero_buf(attn_out, seq * channels)
 
-    scores := alloc(ctx_seq * 4)
-
-    head := 0
-    while head < heads {
-        q_off := head * head_dim
-        i := 0
-        while i < seq {
-            // Compute attention scores over context positions (native dot_f32)
-            mx := 0.0 - 1e30
-            j := 0
-            while j < ctx_seq {
-                dot := dot_f32(q + (i * channels + q_off) * 4, k + (j * channels + q_off) * 4, head_dim)
-                dot = dot * scale
-                poke_f32(scores, j * 4, dot)
-                if dot > mx { mx = dot }
-                j = j + 1
-            }
-            // Softmax: normalize scores so they sum to 1
-            sum := 0.0
-            j = 0
-            while j < ctx_seq {
-                e := exp(peek_f32(scores, j * 4) - mx)
-                poke_f32(scores, j * 4, e)
-                sum = sum + e
-                j = j + 1
-            }
-            inv_sum := 1.0 / sum
-            j = 0
-            while j < ctx_seq {
-                poke_f32(scores, j * 4, peek_f32(scores, j * 4) * inv_sum)
-                j = j + 1
-            }
-            // Weighted sum of V — native axpy_f32
-            // attn_out[i, q_off:q_off+hd] += scores[j] * V[j, q_off:q_off+hd]
-            j = 0
-            while j < ctx_seq {
-                s := peek_f32(scores, j * 4)
-                axpy_f32(attn_out + (i * channels + q_off) * 4, s, v + (j * channels + q_off) * 4, head_dim)
-                j = j + 1
-            }
-            i = i + 1
-        }
-        head = head + 1
-    }
+    scale := 1.0 / sqrt(float(head_dim))
+    attention_f32(q, k, v, attn_out, seq, ctx_seq, channels, heads, scale)
 
     // Output projection: batched matmul (all positions at once)
     matmul_f32(out, attn_out, w_out, b_out, channels, channels, seq)
@@ -195,7 +153,6 @@ func spatial_attention(out, hidden_states, context, prefix, seq, channels, ctx_d
     free(k)
     free(v)
     free(attn_out)
-    free(scores)
 }
 
 // ---- Transformer block (used in UNet attention) ----

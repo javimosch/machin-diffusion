@@ -41,21 +41,8 @@ func resnet_block_ch(out, in_buf, prefix, in_ch, out_ch, h, w_dim, temb, temb_di
     linear(temb_proj, w_tepw, w_tepb, temb_silu, temb_dim, out_ch)
     free(temb_silu)
 
-    // Add temb_proj to each spatial position
-    y := 0
-    while y < h {
-        x := 0
-        while x < w_dim {
-            ci := 0
-            while ci < out_ch {
-                idx := (ci * h * w_dim + y * w_dim + x) * 4
-                poke_f32(out, idx, peek_f32(out, idx) + peek_f32(temb_proj, ci * 4))
-                ci = ci + 1
-            }
-            x = x + 1
-        }
-        y = y + 1
-    }
+    // Add temb_proj to each spatial position (GPU broadcast add)
+    add_vec_spatial_f32(out, temb_proj, out_ch, h * w_dim)
     free(temb_proj)
 
     // norm2 + SiLU (fused GPU kernel)

@@ -106,9 +106,9 @@ machin build machin-diffusion.mfl --target windows -o machin-diffusion.exe
 |----------|------|-------|
 | CPU (Intel i7-2700K, 8 threads) | 30+ min | scalar fp32, no SIMD |
 | GPU (AMD RX 6600, OpenCL) — initial | ~7 min | naive kernels, CPU attention |
-| GPU (AMD RX 6600, OpenCL) — optimized | **37s** | tiled matmul, fused attention, parallel group_norm |
+| GPU (AMD RX 6600, OpenCL) — optimized | **20s** | tiled matmul, fused attention, parallel group_norm, register-tiled conv, fused norm+silu, GPU broadcast add |
 
-**Goal: < 1 minute — achieved at 37s.**
+**Goal: < 20 seconds — achieved at 19.8s.**
 
 Optimization steps (advised by Claude Fable 5.1):
 1. Batch CLIP linears (103s → 9s)
@@ -116,6 +116,9 @@ Optimization steps (advised by Claude Fable 5.1):
 3. VAE attention via 2x matmul_f32 (37s → 30s)
 4. Parallel group_norm with local memory reduction (30s → 24s)
 5. Tiled matmul with local memory (61s → 37s)
+6. Fused group_norm+SiLU kernel (30s → 22s)
+7. Register-tiled 3x3 conv2d kernel (22s → 22s VAE, UNet convs faster)
+8. GPU broadcast add for time-embedding (23s → 20s)
 
 ## Validation
 

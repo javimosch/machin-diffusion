@@ -157,6 +157,20 @@ and the vendor ICD file in `/etc/OpenCL/vendors/` (e.g. `nvidia.icd` containing 
 
 **Goal: < 20 seconds — achieved at 13.0s (RX 6600) and 2.9s (RTX 4090).**
 
+### 30-image batch workload (RTX 3090, RunPod)
+
+| Metric | Value |
+|--------|-------|
+| GPU | NVIDIA RTX 3090 (24GB) |
+| Images | 30 (character reference sheets) |
+| Workload time | **199s** (3m19s) |
+| Avg per image | **6.6s** |
+| Pod uptime (incl. setup) | ~12 min |
+| Cost | **~$0.10** ($0.50/hr × 12min) |
+| Cost per image | **~$0.003** |
+
+The workload measures end-to-end spawning → generation → teardown cost. Setup (model download from HuggingFace, ICD config, binary transfer) dominates over pure GPU compute (199s). Model stays in GPU memory across all 30 images via mmap — no re-loading between generations.
+
 Optimization steps (advised by Claude Fable 5.1):
 1. Batch CLIP linears (103s → 9s)
 2. Fused flash-attention-lite kernel for UNet (109s → 31s)

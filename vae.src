@@ -51,55 +51,65 @@ func vae_attention(out, in_buf, prefix, channels, h, w_dim) {
     matmul_f32(v, hs, w_v, b_v, channels, channels, seq)
     free(hs)
 
-    // Single-head attention — native dot_f32 + axpy_f32
+    // Single-head attention via 2x matmul_f32 (GPU) + softmax
+    // head_dim=512 doesn't fit in registers, so use matmul decomposition
     scale := 1.0 / sqrt(float(channels))
     attn_out := alloc(seq * channels * 4)
-    scores := alloc(seq * 4)
 
+    // scores = Q @ K^T  → [seq, seq]
+    // matmul_f32(scores, q, k, 0, channels, seq, seq): scores[i,j] = dot(Q[i], K[j])
+    scores := alloc(seq * seq * 4)
+    matmul_f32(scores, q, k, 0, channels, seq, seq)
+
+    // Softmax each row (scale + exp + normalize)
     i := 0
     while i < seq {
+        srow := scores + i * seq * 4
         mx := 0.0 - 1e30
         j := 0
         while j < seq {
-            dot := dot_f32(q + i * channels * 4, k + j * channels * 4, channels)
-            dot = dot * scale
-            poke_f32(scores, j * 4, dot)
-            if dot > mx { mx = dot }
+            s := peek_f32(srow, j * 4) * scale
+            if s > mx { mx = s }
             j = j + 1
         }
         sum := 0.0
         j = 0
         while j < seq {
-            e := exp(peek_f32(scores, j * 4) - mx)
-            poke_f32(scores, j * 4, e)
+            e := exp(peek_f32(srow, j * 4) * scale - mx)
+            poke_f32(srow, j * 4, e)
             sum = sum + e
             j = j + 1
         }
-        // Normalize by sum (softmax)
         inv_sum := 1.0 / sum
         j = 0
         while j < seq {
-            poke_f32(scores, j * 4, peek_f32(scores, j * 4) * inv_sum)
-            j = j + 1
-        }
-        // Zero output row, then accumulate with axpy_f32
-        d := 0
-        while d < channels {
-            poke_f32(attn_out, (i * channels + d) * 4, 0.0)
-            d = d + 1
-        }
-        j = 0
-        while j < seq {
-            s := peek_f32(scores, j * 4)
-            axpy_f32(attn_out + i * channels * 4, s, v + j * channels * 4, channels)
+            poke_f32(srow, j * 4, peek_f32(srow, j * 4) * inv_sum)
             j = j + 1
         }
         i = i + 1
     }
+
+    // Transpose V: [seq, channels] → [channels, seq] for matmul
+    v_t := alloc(channels * seq * 4)
+    i = 0
+    while i < seq {
+        j := 0
+        while j < channels {
+            poke_f32(v_t, (j * seq + i) * 4, peek_f32(v, (i * channels + j) * 4))
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    // attn_out = scores @ V  → [seq, channels]
+    // matmul_f32(out, scores, v_t, 0, seq, channels, seq): out[i,c] = dot(scores[i], V[:,c])
+    matmul_f32(attn_out, scores, v_t, 0, seq, channels, seq)
+
     free(q)
     free(k)
     free(v)
     free(scores)
+    free(v_t)
 
     // Output projection (batched)
     w_out, _ := st_tensor(prefix + ".to_out.0.weight")

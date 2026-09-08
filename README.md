@@ -32,6 +32,17 @@ Prompt: `"a girl photo, close take"`, 1-step, guidance=0.0, seed=12345, 512×512
 
 Both images are photo-like with ~75% skin-tone coverage and smooth gradients.
 
+### Gallery
+
+All generated in ~20s each on AMD RX 6600, 1-step, guidance=0.0, seed=12345, 512×512:
+
+| | |
+|---|---|
+| ![Mountain golden hour](docs/images/gallery/mountain-golden-hour.png) | ![Fisherman portrait](docs/images/gallery/fisherman-portrait.png) |
+| `"a mountain landscape at golden hour, dramatic clouds, wide shot"` | `"a portrait of an old fisherman, weathered face, dramatic lighting"` |
+| ![Sports car](docs/images/gallery/sports-car-studio.png) | ![Japanese garden](docs/images/gallery/japanese-garden.png) |
+| `"a futuristic sports car, side view, studio lighting, reflective surface"` | `"a japanese garden with cherry blossoms, peaceful, soft morning light"` |
+
 ## Architecture
 
 ```

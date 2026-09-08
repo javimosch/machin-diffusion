@@ -20,13 +20,10 @@ func resnet_block_ch(out, in_buf, prefix, in_ch, out_ch, h, w_dim, temb, temb_di
     flush()
     tmp := alloc(in_ch * h * w_dim * 4)
 
-    // norm1 (GroupNorm over in_ch channels)
+    // norm1 + SiLU (fused GPU kernel)
     w_n1w, _ := st_tensor(prefix + ".norm1.weight")
     w_n1b, _ := st_tensor(prefix + ".norm1.bias")
-    group_norm(tmp, in_buf, w_n1w, w_n1b, in_ch, h, w_dim, 32, 0.00001)
-
-    // SiLU
-    silu_buf(tmp, in_ch * h * w_dim)
+    group_norm_silu_f32(tmp, in_buf, w_n1w, w_n1b, in_ch, h, w_dim, 32, 0.00001)
 
     // conv1: in_ch → out_ch (3×3, pad=1)
     w_c1w, _ := st_tensor(prefix + ".conv1.weight")
@@ -61,14 +58,11 @@ func resnet_block_ch(out, in_buf, prefix, in_ch, out_ch, h, w_dim, temb, temb_di
     }
     free(temb_proj)
 
-    // norm2
+    // norm2 + SiLU (fused GPU kernel)
     tmp2 := alloc(out_ch * h * w_dim * 4)
     w_n2w, _ := st_tensor(prefix + ".norm2.weight")
     w_n2b, _ := st_tensor(prefix + ".norm2.bias")
-    group_norm(tmp2, out, w_n2w, w_n2b, out_ch, h, w_dim, 32, 0.00001)
-
-    // SiLU
-    silu_buf(tmp2, out_ch * h * w_dim)
+    group_norm_silu_f32(tmp2, out, w_n2w, w_n2b, out_ch, h, w_dim, 32, 0.00001)
 
     // conv2: out_ch → out_ch
     w_c2w, _ := st_tensor(prefix + ".conv2.weight")
@@ -76,16 +70,16 @@ func resnet_block_ch(out, in_buf, prefix, in_ch, out_ch, h, w_dim, temb, temb_di
     conv2d(out, tmp2, w_c2w, w_c2b, out_ch, out_ch, h, w_dim, 3, 3, 1, 1)
     free(tmp2)
 
-    // Residual: need conv_shortcut if in_ch != out_ch
+    // Residual: need conv_shortcut if in_ch != out_ch — use axpy_f32 (vectorized)
     if in_ch != out_ch {
         w_sc_w, _ := st_tensor(prefix + ".conv_shortcut.weight")
         w_sc_b, _ := st_tensor(prefix + ".conv_shortcut.bias")
         shortcut := alloc(out_ch * h * w_dim * 4)
         conv2d(shortcut, in_buf, w_sc_w, w_sc_b, in_ch, out_ch, h, w_dim, 1, 1, 0, 1)
-        add_buf(out, shortcut, out_ch * h * w_dim)
+        axpy_f32(out, 1.0, shortcut, out_ch * h * w_dim)
         free(shortcut)
     } else {
-        add_buf(out, in_buf, out_ch * h * w_dim)
+        axpy_f32(out, 1.0, in_buf, out_ch * h * w_dim)
     }
     println(" done")
     flush()

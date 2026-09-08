@@ -141,11 +141,10 @@ func vae_attention(out, in_buf, prefix, channels, h, w_dim) {
 func vae_resnet_block(out, in_buf, prefix, in_ch, out_ch, h, w_dim) {
     tmp := alloc(in_ch * h * w_dim * 4)
 
-    // norm1
+    // norm1 + SiLU (fused GPU kernel)
     w_n1w, _ := st_tensor(prefix + ".norm1.weight")
     w_n1b, _ := st_tensor(prefix + ".norm1.bias")
-    group_norm(tmp, in_buf, w_n1w, w_n1b, in_ch, h, w_dim, 32, 0.000001)
-    silu_buf(tmp, in_ch * h * w_dim)
+    group_norm_silu_f32(tmp, in_buf, w_n1w, w_n1b, in_ch, h, w_dim, 32, 0.000001)
 
     // conv1: in_ch → out_ch
     w_c1w, _ := st_tensor(prefix + ".conv1.weight")
@@ -153,12 +152,11 @@ func vae_resnet_block(out, in_buf, prefix, in_ch, out_ch, h, w_dim) {
     conv2d(out, tmp, w_c1w, w_c1b, in_ch, out_ch, h, w_dim, 3, 3, 1, 1)
     free(tmp)
 
-    // norm2
+    // norm2 + SiLU (fused GPU kernel)
     tmp2 := alloc(out_ch * h * w_dim * 4)
     w_n2w, _ := st_tensor(prefix + ".norm2.weight")
     w_n2b, _ := st_tensor(prefix + ".norm2.bias")
-    group_norm(tmp2, out, w_n2w, w_n2b, out_ch, h, w_dim, 32, 0.000001)
-    silu_buf(tmp2, out_ch * h * w_dim)
+    group_norm_silu_f32(tmp2, out, w_n2w, w_n2b, out_ch, h, w_dim, 32, 0.000001)
 
     // conv2: out_ch → out_ch
     w_c2w, _ := st_tensor(prefix + ".conv2.weight")
@@ -166,16 +164,16 @@ func vae_resnet_block(out, in_buf, prefix, in_ch, out_ch, h, w_dim) {
     conv2d(out, tmp2, w_c2w, w_c2b, out_ch, out_ch, h, w_dim, 3, 3, 1, 1)
     free(tmp2)
 
-    // Residual (with shortcut if channels differ)
+    // Residual (with shortcut if channels differ) — use axpy_f32 (vectorized)
     if in_ch != out_ch {
         w_sc_w, _ := st_tensor(prefix + ".conv_shortcut.weight")
         w_sc_b, _ := st_tensor(prefix + ".conv_shortcut.bias")
         shortcut := alloc(out_ch * h * w_dim * 4)
         conv2d(shortcut, in_buf, w_sc_w, w_sc_b, in_ch, out_ch, h, w_dim, 1, 1, 0, 1)
-        add_buf(out, shortcut, out_ch * h * w_dim)
+        axpy_f32(out, 1.0, shortcut, out_ch * h * w_dim)
         free(shortcut)
     } else {
-        add_buf(out, in_buf, out_ch * h * w_dim)
+        axpy_f32(out, 1.0, in_buf, out_ch * h * w_dim)
     }
 }
 
@@ -184,6 +182,7 @@ func vae_resnet_block(out, in_buf, prefix, in_ch, out_ch, h, w_dim) {
 func vae_decode(latent) (image) {
     h := 64
     w := 64
+    vt0 := now_ms()
 
     // post_quant_conv: Conv2d(4, 4, 1)
     w_pqc_w, _ := st_tensor("post_quant_conv.weight")
@@ -198,10 +197,14 @@ func vae_decode(latent) (image) {
     conv2d(x2, x, w_cin_w, w_cin_b, 4, 512, h, w, 3, 3, 1, 1)
     free(x)
     x = x2
+    vt_conv_in := now_ms() - vt0
+    println("  vae conv_in: " + str(vt_conv_in) + "ms")
+    flush()
 
     // mid_block: resnet_0 + attention + resnet_1
     println("  vae mid_block...")
     flush()
+    vt1 := now_ms()
     mid0 := alloc(512 * h * w * 4)
     vae_resnet_block(mid0, x, "decoder.mid_block.resnets.0", 512, 512, h, w)
     free(x)
@@ -216,10 +219,12 @@ func vae_decode(latent) (image) {
     vae_resnet_block(mid1, x, "decoder.mid_block.resnets.1", 512, 512, h, w)
     free(x)
     x = mid1
-    println("  vae mid_block done")
+    vt_mid := now_ms() - vt1
+    println("  vae mid_block done: " + str(vt_mid) + "ms")
     flush()
 
     // up_blocks: 0(512→512, up), 1(512→512, up), 2(512→256, up), 3(256→128, no up)
+    vt2 := now_ms()
     ub := 0
     while ub < 4 {
         println("  vae up_block " + str(ub) + " (h=" + str(h) + ")")
@@ -262,13 +267,15 @@ func vae_decode(latent) (image) {
         }
         ub = ub + 1
     }
+    vt_up := now_ms() - vt2
+    println("  vae up_blocks: " + str(vt_up) + "ms")
+    flush()
 
-    // conv_norm_out: GroupNorm(32, 128) + SiLU
+    // conv_norm_out: GroupNorm(32, 128) + SiLU (fused GPU kernel)
     w_cno_w, _ := st_tensor("decoder.conv_norm_out.weight")
     w_cno_b, _ := st_tensor("decoder.conv_norm_out.bias")
     normed := alloc(128 * h * w * 4)
-    group_norm(normed, x, w_cno_w, w_cno_b, 128, h, w, 32, 0.000001)
-    silu_buf(normed, 128 * h * w)
+    group_norm_silu_f32(normed, x, w_cno_w, w_cno_b, 128, h, w, 32, 0.000001)
     free(x)
 
     // conv_out: Conv2d(128, 3, 3, pad=1)
@@ -277,5 +284,8 @@ func vae_decode(latent) (image) {
     image = alloc(3 * h * w * 4)
     conv2d(image, normed, w_cout_w, w_cout_b, 128, 3, h, w, 3, 3, 1, 1)
     free(normed)
+    vt_out := now_ms() - vt0 - vt_conv_in - vt_mid - vt_up
+    println("  vae conv_out: " + str(vt_out) + "ms")
+    flush()
     return
 }

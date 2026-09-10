@@ -1,0 +1,172 @@
+// main_sdxl.src — SDXL-Lightning entry point
+// Usage: machin-diffusion-sdxl <model_dir> <token_ids_file> [output.ppm] [debug_dir]
+// Full pipeline: dual CLIP → UNet (4-step) → VAE → PPM image (1024x1024)
+
+var modelDir = ""
+var debugDir = ""
+
+func dump_raw(path, buf, n) {
+    if len(debugDir) == 0 { return }
+    write_file_raw(path, buf, n * 4)
+}
+
+func main() {
+    argv := args()
+    if len(argv) < 3 {
+        println("usage: machin-diffusion-sdxl <model_dir> <token_ids_file> [output.ppm] [debug_dir]")
+        println("  model_dir contains text_encoder/, text_encoder_2/, unet_4step_fp32.safetensors, vae/")
+        println("  token_ids_file: one int per line (use scripts/tokenize.py)")
+        exit(1)
+    }
+
+    modelDir = argv[1]
+    tokensPath := argv[2]
+    outPath := "output.ppm"
+    if len(argv) > 3 { outPath = argv[3] }
+    if len(argv) > 4 { debugDir = argv[4] }
+    modelDir = replace(modelDir, "\\", "/")
+
+    println("machin-diffusion-sdxl — SDXL-Lightning 4-step in pure MFL")
+    println("model: " + modelDir)
+    flush()
+
+    // Init OpenCL
+    gpu := ocl_init()
+    if gpu == 1 {
+        println("GPU: OpenCL initialized")
+    } else {
+        println("GPU: not available, using CPU")
+    }
+    flush()
+
+    // 1. Read token IDs
+    tokenText := read_file(tokensPath)
+    if len(tokenText) == 0 { println("cannot read " + tokensPath)  exit(1) }
+    tokenLines := split(tokenText, "\n")
+    token_ids := []int{}
+    for _, line := range tokenLines {
+        if len(line) == 0 { continue }
+        token_ids = append(token_ids, parse_int(line))
+    }
+    seq := len(token_ids)
+    if seq > sdxl_max_pos { seq = sdxl_max_pos }
+    println("tokens: " + str(seq))
+
+    // 2. Dual text encoder
+    println("=== Dual text encoder ===")
+    flush()
+    t0 := now_ms()
+    context, pooled := clip_sdxl_forward(token_ids, seq)
+    t_clip := now_ms() - t0
+    println("CLIP done: [77, 2048] + pooled [1280] [" + str(t_clip) + "ms]")
+    flush()
+    if len(debugDir) > 0 {
+        dump_raw(debugDir + "/context.bin", context, sdxl_max_pos * 2048)
+    }
+
+    // 3. Generate random latent noise [4, 128, 128]
+    println("=== Generating noise ===")
+    latent_size := 4 * 128 * 128
+    latent := alloc(latent_size * 4)
+    generate_noise(latent, latent_size)
+    init_noise_sigma := 14.614641
+    i := 0
+    while i < latent_size {
+        poke_f32(latent, i * 4, peek_f32(latent, i * 4) * init_noise_sigma)
+        i = i + 1
+    }
+    if len(debugDir) > 0 { dump_raw(debugDir + "/init_latent.bin", latent, latent_size) }
+
+    // 4. 4-step denoising loop (EulerDiscrete, trailing)
+    // sigmas = [14.614641, 4.081729, 1.612886, 0.693205, 0.0]
+    // timesteps = [999, 749, 499, 249]
+    sigmas := []float{14.614641, 4.081729, 1.612886, 0.693205, 0.0}
+    timesteps := []int{999, 749, 499, 249}
+
+    println("=== UNet 4-step denoising ===")
+    flush()
+    t1 := now_ms()
+    // Open UNet safetensors once for all 4 steps
+    st_open(modelDir + "/unet_4step_fp32.safetensors")
+    step := 0
+    while step < 4 {
+        ts_step := now_ms()
+        sigma := sigmas[step]
+        sigma_next := sigmas[step + 1]
+        timestep := timesteps[step]
+
+        // Scale input: x / sqrt(sigma^2 + 1)
+        scale_in := 1.0 / sqrt(sigma * sigma + 1.0)
+        unet_input := alloc(latent_size * 4)
+        i = 0
+        while i < latent_size {
+            poke_f32(unet_input, i * 4, peek_f32(latent, i * 4) * scale_in)
+            i = i + 1
+        }
+
+        // UNet forward
+        noise_pred := unet_sdxl_forward(unet_input, context, pooled, timestep)
+        free(unet_input)
+        if step == 0 && len(debugDir) > 0 {
+            dump_raw(debugDir + "/noise_pred_step0.bin", noise_pred, latent_size)
+        }
+
+        // Euler step: denoised = x - sigma * noise_pred; x_next = denoised + sigma_next * noise_pred
+        i = 0
+        while i < latent_size {
+            x := peek_f32(latent, i * 4)
+            np := peek_f32(noise_pred, i * 4)
+            denoised := x - sigma * np
+            poke_f32(latent, i * 4, denoised + sigma_next * np)
+            i = i + 1
+        }
+        free(noise_pred)
+
+        println("  step " + str(step + 1) + "/4: " + str(now_ms() - ts_step) + "ms")
+        flush()
+        step = step + 1
+    }
+    st_close()
+    t_unet := now_ms() - t1
+    println("UNet done [" + str(t_unet) + "ms]")
+    flush()
+    if len(debugDir) > 0 { dump_raw(debugDir + "/final_latent.bin", latent, latent_size) }
+
+    // 5. VAE decode [4, 128, 128] → [3, 1024, 1024]
+    println("=== VAE decode ===")
+    flush()
+    t2 := now_ms()
+    // Scale latent by VAE factor
+    vae_scale := 0.13025
+    i = 0
+    while i < latent_size {
+        poke_f32(latent, i * 4, peek_f32(latent, i * 4) / vae_scale)
+        i = i + 1
+    }
+    st_open(modelDir + "/vae/diffusion_pytorch_model.safetensors")
+    image := vae_decode_sdxl(latent)
+    free(latent)
+    if len(debugDir) > 0 { dump_raw(debugDir + "/vae_output.bin", image, 3 * 1024 * 1024) }
+    t_vae := now_ms() - t2
+    println("VAE done [" + str(t_vae) + "ms]")
+    flush()
+
+    // 6. Write PPM image (1024x1024)
+    println("=== Writing image ===")
+    flush()
+    write_ppm(outPath, image, 1024, 1024)
+    free(image)
+
+    // Timing
+    t_total := t_clip + t_unet + t_vae
+    println("=== Timing ===")
+    println("CLIP: " + str(t_clip) + "ms")
+    println("UNet: " + str(t_unet) + "ms (4 steps)")
+    println("VAE:  " + str(t_vae) + "ms")
+    println("Total: " + str(t_total) + "ms (" + str(t_total / 1000) + "s)")
+    flush()
+
+    println("=== Complete! ===")
+    println("Output: " + outPath)
+    flush()
+}

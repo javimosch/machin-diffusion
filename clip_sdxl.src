@@ -1,0 +1,318 @@
+// clip_sdxl.src — SDXL dual text encoders (pure MFL)
+// TE1: CLIP ViT-L/14 — 768 dim, 12 heads, 12 layers, intermediate=3072, quick_gelu
+// TE2: OpenCLIP ViT-bigG — 1280 dim, 20 heads, 32 layers, intermediate=5120, gelu
+// Output: concatenated context [77, 2048] + pooled [1280] from TE2
+
+// ---- SDXL TE config ----
+var sdxl_te1_hidden = 768
+var sdxl_te1_heads = 12
+var sdxl_te1_layers = 12
+var sdxl_te1_inter = 3072
+var sdxl_te2_hidden = 1280
+var sdxl_te2_heads = 20
+var sdxl_te2_layers = 32
+var sdxl_te2_inter = 5120
+var sdxl_max_pos = 77
+var sdxl_eps = 0.00001
+
+// Current encoder state (set before calling clip_sdxl_forward_te)
+var sdxl_cur_hidden = 0
+var sdxl_cur_heads = 0
+var sdxl_cur_layers = 0
+var sdxl_cur_inter = 0
+var sdxl_cur_act = 0  // 0=quick_gelu, 1=gelu_tanh
+
+// Weight pointers (loaded per encoder)
+var sdxl_w_tok = 0
+var sdxl_w_pos = 0
+var sdxl_w_fln_w = 0
+var sdxl_w_fln_b = 0
+var sdxl_w_ln1_w = []int{}
+var sdxl_w_ln1_b = []int{}
+var sdxl_w_ln2_w = []int{}
+var sdxl_w_ln2_b = []int{}
+var sdxl_w_q_w = []int{}
+var sdxl_w_q_b = []int{}
+var sdxl_w_k_w = []int{}
+var sdxl_w_k_b = []int{}
+var sdxl_w_v_w = []int{}
+var sdxl_w_v_b = []int{}
+var sdxl_w_o_w = []int{}
+var sdxl_w_o_b = []int{}
+var sdxl_w_fc1_w = []int{}
+var sdxl_w_fc1_b = []int{}
+var sdxl_w_fc2_w = []int{}
+var sdxl_w_fc2_b = []int{}
+var sdxl_w_text_proj_w = 0  // TE2 only
+
+// Standard GELU (tanh approximation) for TE2
+func gelu_tanh(x) (r) {
+    if x > 20.0 { r = x  return }
+    if x < 0.0 - 20.0 { r = 0.0  return }
+    c := 0.7978845608 * (x + 0.044715 * x * x * x)
+    r = 0.5 * x * (1.0 + tanh_approx(c))
+    return
+}
+
+func sdxl_gelu(x) (r) {
+    if sdxl_cur_act == 0 { r = gelu(x)  return }
+    r = gelu_tanh(x)
+    return
+}
+
+// Load text encoder weights from opened safetensors
+func clip_sdxl_load_te(prefix) {
+    sdxl_w_tok = 0  sdxl_w_pos = 0  sdxl_w_fln_w = 0  sdxl_w_fln_b = 0
+    sdxl_w_ln1_w = []int{}  sdxl_w_ln1_b = []int{}
+    sdxl_w_ln2_w = []int{}  sdxl_w_ln2_b = []int{}
+    sdxl_w_q_w = []int{}  sdxl_w_q_b = []int{}
+    sdxl_w_k_w = []int{}  sdxl_w_k_b = []int{}
+    sdxl_w_v_w = []int{}  sdxl_w_v_b = []int{}
+    sdxl_w_o_w = []int{}  sdxl_w_o_b = []int{}
+    sdxl_w_fc1_w = []int{}  sdxl_w_fc1_b = []int{}
+    sdxl_w_fc2_w = []int{}  sdxl_w_fc2_b = []int{}
+    sdxl_w_text_proj_w = 0
+
+    p, _ := st_tensor(prefix + "text_model.embeddings.token_embedding.weight")
+    sdxl_w_tok = p
+    p, _ = st_tensor(prefix + "text_model.embeddings.position_embedding.weight")
+    sdxl_w_pos = p
+    p, _ = st_tensor(prefix + "text_model.final_layer_norm.weight")
+    sdxl_w_fln_w = p
+    p, _ = st_tensor(prefix + "text_model.final_layer_norm.bias")
+    sdxl_w_fln_b = p
+
+    i := 0
+    while i < sdxl_cur_layers {
+        lp := "text_model.encoder.layers." + str(i) + "."
+        p, _ = st_tensor(prefix + lp + "layer_norm1.weight")
+        sdxl_w_ln1_w = append(sdxl_w_ln1_w, p)
+        p, _ = st_tensor(prefix + lp + "layer_norm1.bias")
+        sdxl_w_ln1_b = append(sdxl_w_ln1_b, p)
+        p, _ = st_tensor(prefix + lp + "layer_norm2.weight")
+        sdxl_w_ln2_w = append(sdxl_w_ln2_w, p)
+        p, _ = st_tensor(prefix + lp + "layer_norm2.bias")
+        sdxl_w_ln2_b = append(sdxl_w_ln2_b, p)
+        p, _ = st_tensor(prefix + lp + "self_attn.q_proj.weight")
+        sdxl_w_q_w = append(sdxl_w_q_w, p)
+        p, _ = st_tensor(prefix + lp + "self_attn.q_proj.bias")
+        sdxl_w_q_b = append(sdxl_w_q_b, p)
+        p, _ = st_tensor(prefix + lp + "self_attn.k_proj.weight")
+        sdxl_w_k_w = append(sdxl_w_k_w, p)
+        p, _ = st_tensor(prefix + lp + "self_attn.k_proj.bias")
+        sdxl_w_k_b = append(sdxl_w_k_b, p)
+        p, _ = st_tensor(prefix + lp + "self_attn.v_proj.weight")
+        sdxl_w_v_w = append(sdxl_w_v_w, p)
+        p, _ = st_tensor(prefix + lp + "self_attn.v_proj.bias")
+        sdxl_w_v_b = append(sdxl_w_v_b, p)
+        p, _ = st_tensor(prefix + lp + "self_attn.out_proj.weight")
+        sdxl_w_o_w = append(sdxl_w_o_w, p)
+        p, _ = st_tensor(prefix + lp + "self_attn.out_proj.bias")
+        sdxl_w_o_b = append(sdxl_w_o_b, p)
+        p, _ = st_tensor(prefix + lp + "mlp.fc1.weight")
+        sdxl_w_fc1_w = append(sdxl_w_fc1_w, p)
+        p, _ = st_tensor(prefix + lp + "mlp.fc1.bias")
+        sdxl_w_fc1_b = append(sdxl_w_fc1_b, p)
+        p, _ = st_tensor(prefix + lp + "mlp.fc2.weight")
+        sdxl_w_fc2_w = append(sdxl_w_fc2_w, p)
+        p, _ = st_tensor(prefix + lp + "mlp.fc2.bias")
+        sdxl_w_fc2_b = append(sdxl_w_fc2_b, p)
+        i = i + 1
+    }
+
+    // text_projection (TE2 only, may not exist for TE1)
+    tp, tp_ok := st_tensor(prefix + "text_projection.weight")
+    if tp_ok > 0 { sdxl_w_text_proj_w = tp }
+}
+
+// Forward pass for one text encoder (uses sdxl_cur_* state)
+// Output: [seq, sdxl_cur_hidden] in sdxl_x
+// pooled_out: [sdxl_cur_hidden] — hidden state at EOS position after final_layer_norm
+var sdxl_x = 0
+var sdxl_q = 0
+var sdxl_k = 0
+var sdxl_v = 0
+var sdxl_hb = 0
+var sdxl_hb2 = 0
+
+func clip_sdxl_forward_te(token_ids, seq) (pooled_out) {
+    h := sdxl_cur_hidden
+    hd := h / sdxl_cur_heads
+    inter := sdxl_cur_inter
+
+    sdxl_x = alloc(sdxl_max_pos * h * 4)
+    sdxl_q = alloc(sdxl_max_pos * h * 4)
+    sdxl_k = alloc(sdxl_max_pos * h * 4)
+    sdxl_v = alloc(sdxl_max_pos * h * 4)
+    sdxl_hb = alloc(sdxl_max_pos * inter * 4)
+    sdxl_hb2 = alloc(sdxl_max_pos * h * 4)
+
+    // 1. Embeddings
+    pos := 0
+    while pos < seq {
+        tid := token_ids[pos]
+        src := sdxl_w_tok + tid * h * 4
+        dst := sdxl_x + pos * h * 4
+        i := 0
+        while i < h {
+            poke_f32(dst, i * 4, peek_f32(src, i * 4) + peek_f32(sdxl_w_pos, pos * h * 4 + i * 4))
+            i = i + 1
+        }
+        pos = pos + 1
+    }
+
+    // 2. Transformer layers
+    layer := 0
+    while layer < sdxl_cur_layers {
+        // --- Self-Attention ---
+        ocl_sync()
+        ln_out := alloc(seq * h * 4)
+        layer_norm_batch(ln_out, sdxl_x, sdxl_w_ln1_w[layer], sdxl_w_ln1_b[layer], seq, h)
+
+        // QKV with bias
+        matmul_f32(sdxl_q, ln_out, sdxl_w_q_w[layer], sdxl_w_q_b[layer], h, h, seq)
+        matmul_f32(sdxl_k, ln_out, sdxl_w_k_w[layer], sdxl_w_k_b[layer], h, h, seq)
+        matmul_f32(sdxl_v, ln_out, sdxl_w_v_w[layer], sdxl_w_v_b[layer], h, h, seq)
+        ocl_sync()
+        free(ln_out)
+
+        // Multi-head attention (CAUSAL — CLIP text encoders use causal masking)
+        attn_out := alloc(seq * h * 4)
+        zero_buf(attn_out, seq * h)
+        scale := 1.0 / sqrt(float(hd))
+        attention_causal_f32(sdxl_q, sdxl_k, sdxl_v, attn_out, seq, seq, h, sdxl_cur_heads, scale)
+        ocl_sync()
+
+        // Out projection + residual
+        proj_out := alloc(seq * h * 4)
+        matmul_f32(proj_out, attn_out, sdxl_w_o_w[layer], sdxl_w_o_b[layer], h, h, seq)
+        ocl_sync()
+        free(attn_out)
+        axpy_f32(sdxl_x, 1.0, proj_out, seq * h)
+        ocl_sync()
+        free(proj_out)
+
+        // --- MLP ---
+        ln2_out := alloc(seq * h * 4)
+        layer_norm_batch(ln2_out, sdxl_x, sdxl_w_ln2_w[layer], sdxl_w_ln2_b[layer], seq, h)
+
+        matmul_f32(sdxl_hb, ln2_out, sdxl_w_fc1_w[layer], sdxl_w_fc1_b[layer], h, inter, seq)
+        ocl_sync()
+        free(ln2_out)
+
+        i := 0
+        while i < seq * inter {
+            poke_f32(sdxl_hb, i * 4, sdxl_gelu(peek_f32(sdxl_hb, i * 4)))
+            i = i + 1
+        }
+
+        matmul_f32(sdxl_hb2, sdxl_hb, sdxl_w_fc2_w[layer], sdxl_w_fc2_b[layer], inter, h, seq)
+        ocl_sync()
+        axpy_f32(sdxl_x, 1.0, sdxl_hb2, seq * h)
+        ocl_sync()
+
+        layer = layer + 1
+    }
+
+    // 3. Final layer norm
+    ocl_sync()
+    pos = 0
+    while pos < seq {
+        xrow := sdxl_x + pos * h * 4
+        layer_norm(xrow, xrow, sdxl_w_fln_w, sdxl_w_fln_b, h)
+        pos = pos + 1
+    }
+
+    // 4. Pooled output: hidden state at EOS position
+    // SDXL uses argmax(token_ids) to find EOS (49407 is highest token ID)
+    eos_pos := 0
+    max_id := 0
+    i := 0
+    while i < seq {
+        if token_ids[i] > max_id { max_id = token_ids[i]  eos_pos = i }
+        i = i + 1
+    }
+    pooled_out = alloc(h * 4)
+    i = 0
+    while i < h {
+        poke_f32(pooled_out, i * 4, peek_f32(sdxl_x, eos_pos * h * 4 + i * 4))
+        i = i + 1
+    }
+}
+
+// Load both text encoders and run forward pass
+// Returns: context [77, 2048], pooled [1280]
+func clip_sdxl_forward(token_ids, seq) (context, pooled) {
+    // --- TE1 ---
+    sdxl_cur_hidden = sdxl_te1_hidden
+    sdxl_cur_heads = sdxl_te1_heads
+    sdxl_cur_layers = sdxl_te1_layers
+    sdxl_cur_inter = sdxl_te1_inter
+    sdxl_cur_act = 0  // quick_gelu
+
+    st_open(modelDir + "/text_encoder/model.safetensors")
+    clip_sdxl_load_te("")
+    te1_pooled := clip_sdxl_forward_te(token_ids, seq)
+
+    // Copy TE1 output [seq, 768]
+    te1_out := alloc(sdxl_max_pos * sdxl_te1_hidden * 4)
+    copy_buf(te1_out, sdxl_x, sdxl_max_pos * sdxl_te1_hidden)
+    if len(debugDir) > 0 { dump_raw(debugDir + "/te1_hidden.bin", sdxl_x, sdxl_max_pos * sdxl_te1_hidden) }
+    free(sdxl_x)  free(sdxl_q)  free(sdxl_k)  free(sdxl_v)  free(sdxl_hb)  free(sdxl_hb2)
+    free(te1_pooled)
+    st_close()
+
+    // --- TE2 ---
+    sdxl_cur_hidden = sdxl_te2_hidden
+    sdxl_cur_heads = sdxl_te2_heads
+    sdxl_cur_layers = sdxl_te2_layers
+    sdxl_cur_inter = sdxl_te2_inter
+    sdxl_cur_act = 1  // gelu_tanh
+
+    st_open(modelDir + "/text_encoder_2/model.safetensors")
+    clip_sdxl_load_te("")
+    te2_pooled := clip_sdxl_forward_te(token_ids, seq)
+
+    // Copy TE2 output [seq, 1280]
+    te2_out := alloc(sdxl_max_pos * sdxl_te2_hidden * 4)
+    copy_buf(te2_out, sdxl_x, sdxl_max_pos * sdxl_te2_hidden)
+    if len(debugDir) > 0 {
+        dump_raw(debugDir + "/te2_hidden.bin", sdxl_x, sdxl_max_pos * sdxl_te2_hidden)
+        dump_raw(debugDir + "/te2_pooled_raw.bin", te2_pooled, sdxl_te2_hidden)
+    }
+    free(sdxl_x)  free(sdxl_q)  free(sdxl_k)  free(sdxl_v)  free(sdxl_hb)  free(sdxl_hb2)
+
+    // Apply text_projection BEFORE st_close (weight is in mmap)
+    pooled = alloc(sdxl_te2_hidden * 4)
+    if sdxl_w_text_proj_w != 0 {
+        matmul_f32(pooled, te2_pooled, sdxl_w_text_proj_w, 0, sdxl_te2_hidden, sdxl_te2_hidden, 1)
+        ocl_sync()
+    } else {
+        copy_buf(pooled, te2_pooled, sdxl_te2_hidden)
+    }
+    if len(debugDir) > 0 { dump_raw(debugDir + "/pooled.bin", pooled, sdxl_te2_hidden) }
+    free(te2_pooled)
+    st_close()
+
+    // Concatenate TE1 [77, 768] + TE2 [77, 1280] → [77, 2048]
+    context = alloc(sdxl_max_pos * (sdxl_te1_hidden + sdxl_te2_hidden) * 4)
+    pos := 0
+    while pos < sdxl_max_pos {
+        te1_row := te1_out + pos * sdxl_te1_hidden * 4
+        te2_row := te2_out + pos * sdxl_te2_hidden * 4
+        ctx_row := context + pos * (sdxl_te1_hidden + sdxl_te2_hidden) * 4
+        i := 0
+        while i < sdxl_te1_hidden {
+            poke_f32(ctx_row, i * 4, peek_f32(te1_row, i * 4))
+            i = i + 1
+        }
+        i = 0
+        while i < sdxl_te2_hidden {
+            poke_f32(ctx_row, (sdxl_te1_hidden + i) * 4, peek_f32(te2_row, i * 4))
+            i = i + 1
+        }
+        pos = pos + 1
+    }
+    free(te1_out)
+    free(te2_out)
+}

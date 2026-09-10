@@ -101,3 +101,36 @@ python3 scripts/tokenize.py models/sd-turbo/tokenizer/vocab.json models/sd-turbo
 - GPU: AMD RX 6600 (OpenCL)
 - CPU baseline: Intel i7-2700K
 - OpenCL path is `#ifdef _WIN32` — Windows only. CPU fallback for other platforms.
+
+## SDXL-Lightning architecture (separate pipeline)
+
+A separate SDXL-Lightning 4-step pipeline exists (`clip_sdxl.src`, `unet_sdxl.src`,
+`main_sdxl.src`, `build_sdxl.sh`). Key differences from SD-Turbo:
+
+### Dual text encoders
+- **TE1**: CLIP ViT-L/14 — hidden 768, 12 heads, 12 layers, intermediate 3072, quick GELU
+- **TE2**: OpenCLIP ViT-bigG — hidden 1280, 20 heads, 32 layers, intermediate 5120, GELU tanh
+- Context output: `[77, 2048]` = concat(TE1 `[77, 768]`, TE2 `[77, 1280]`)
+- Pooled output: `[1280]` from TE2 — hidden state at EOS position after `final_layer_norm`,
+  then projected through `text_projection.weight` (1280×1280)
+- **EOS position**: found by scanning token IDs for the highest ID (49407), NOT `seq-1`
+- **CAUSAL attention required**: both TE1 and TE2 use causal attention (`attention_causal_f32`).
+  Using bidirectional `attention_f32` produces 0.18 correlation → abstract noise output.
+
+### SDXL UNet
+- 2.6B params, [1,2,10] transformer blocks (1 down, 2 mid, 10 up)
+- ADM/additional conditioning: `add_time_ids` [1024,1024,0,0,1024,1024] sinusoidally embedded,
+  concatenated with 1280d pooled text → 2816d → projected to 1280d
+- 4-step denoising with EulerDiscreteScheduler (trailing spacing)
+- Sigmas: [14.615, 4.082, 1.613, 0.693, 0.0], timesteps: [999, 749, 499, 249]
+
+### SDXL VAE
+- Latent [4, 128, 128] → image [3, 1024, 1024]
+- Scaling factor: 0.13025 (latents divided by this before decode)
+
+### `attention_causal_f32` builtin
+
+Added to the machin compiler for SDXL CLIP. Same signature as `attention_f32` but
+position i only attends to positions j ≤ i (causal mask). Has both OpenCL GPU kernel
+and CPU fallback. The SD-Turbo `clip.src` already had a scalar causal attention loop;
+the SDXL port needed the fused GPU version.

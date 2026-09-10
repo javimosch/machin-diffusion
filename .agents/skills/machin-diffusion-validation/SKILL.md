@@ -82,3 +82,58 @@ rcx ordi-jla "certutil -encode output.ppm out.b64 && type out.b64" 60 > /tmp/raw
 ## Don't claim byte-identical
 
 After fused kernels, output is numerically equivalent but not bit-identical. Use measured tolerances (mean < 0.05, max ≤ 1) in documentation, not "byte-identical" or "exact".
+
+## SDXL-Lightning validation (2026-09-08)
+
+### Critical finding: CLIP attention must be CAUSAL
+
+CLIP text encoders (both TE1 and TE2) use **causal** attention — position i only attends
+to positions j ≤ i. The SDXL port originally used bidirectional `attention_f32`, which
+produced TE2 hidden states with only **0.18 correlation** to the diffusers reference.
+This was the root cause of the abstract noise output.
+
+**Fix:** Added `attention_causal_f32` builtin to the machin compiler (OpenCL kernel +
+CPU fallback). After the fix, TE2 hidden correlation jumped to **0.9993**.
+
+### SDXL reference setup (RunPod)
+
+The reference pipeline (`scripts/sdxl_reference.py`) loads components directly:
+- `CLIPTextModel` (TE1) + `CLIPTextModelWithProjection` (TE2) with `attn_implementation="eager"`
+- `EulerDiscreteScheduler` with `timestep_spacing="trailing"`, 4 timesteps
+- `UNet2DConditionModel` loaded from `unet_4step_fp32.safetensors`
+- `AutoencoderKL` with `scaling_factor=0.13025`
+
+**Package compatibility:** torch 2.5.1+cu121, transformers 4.48.3, diffusers 0.40.0,
+huggingface_hub 1.30.0. Earlier versions had import errors (CLIPImageProcessor removed
+in transformers 5.x, `get_cached_repo_tree` missing in old hub, SDPA causal mask shape bug).
+
+### Validated stages
+
+| Stage | Metric | Value |
+|-------|--------|-------|
+| TE2 hidden [77×1280] | correlation | 0.9993 |
+| TE2 hidden | mean_diff | 0.019 |
+| Scheduler sigmas | exact | [14.615, 4.082, 1.613, 0.693, 0.0] |
+| Scheduler timesteps | exact | [999, 749, 499, 249] |
+| VAE scaling factor | exact | 0.13025 |
+
+### Pending validation (pod terminated, low balance)
+
+- UNet step-0 noise prediction
+- VAE decode output
+- Pooled output after text_projection
+- Visual image comparison
+
+### Debug dump format
+
+`main_sdxl.src` accepts an optional 4th argument `debug_dir`. When provided, dumps:
+- `te2_hidden.bin` — [77, 1280] float32
+- `te2_pooled_raw.bin` — [1280] float32 (before text_projection)
+- `vae_output.bin` — [3, 1024, 1024] float32
+
+The reference saves `.npy` files for all stages. Compare with:
+```python
+ref = np.load('/workspace/ref/te2_hidden.npy')[0]  # [77, 1280]
+ours = np.fromfile('/workspace/our/te2_hidden.bin', dtype=np.float32).reshape(77, 1280)
+corr = np.corrcoef(ref.flatten(), ours.flatten())[0,1]
+```

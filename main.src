@@ -182,6 +182,9 @@ func main() {
     println("Total: " + str(t_total) + "ms (" + str(t_total / 1000) + "s)")
     flush()
 
+    prof_print()
+    ocl_release()
+
     println("=== Complete! ===")
     println("Output: " + outPath)
     flush()

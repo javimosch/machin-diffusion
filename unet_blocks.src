@@ -222,7 +222,8 @@ func transformer_block(out, hidden_states, context, prefix, seq, channels, ctx_s
 //
 // input: [C, H, W] → reshape to [H*W, C] → attention → reshape back → residual
 // use_linear_projection: true (proj_in/out are Linear, not Conv2d)
-func attention_block(out, in_buf, context, prefix, channels, h, w_dim, ctx_seq, cross_dim, heads) {
+// n_transformers: number of transformer blocks (1 for SD-Turbo, [1,2,10] for SDXL)
+func attention_block(out, in_buf, context, prefix, channels, h, w_dim, ctx_seq, cross_dim, heads, n_transformers) {
     seq := h * w_dim
 
     // Ensure in_buf is on host (needed as residual for transpose_add at the end)
@@ -246,10 +247,18 @@ func attention_block(out, in_buf, context, prefix, channels, h, w_dim, ctx_seq, 
     matmul_f32(proj_in_out, hs, w_pin_w, w_pin_b, channels, channels, seq)
     free(hs)
 
-    // Transformer block (only 1 layer per block for SD-Turbo)
+    // Transformer blocks (n_transformers per attention block)
     tb_out := alloc(seq * channels * 4)
-    transformer_block(tb_out, proj_in_out, context, prefix + ".transformer_blocks.0", seq, channels, ctx_seq, cross_dim, heads)
+    copy_buf(tb_out, proj_in_out, seq * channels)
     free(proj_in_out)
+    ti := 0
+    while ti < n_transformers {
+        tb_next := alloc(seq * channels * 4)
+        transformer_block(tb_next, tb_out, context, prefix + ".transformer_blocks." + str(ti), seq, channels, ctx_seq, cross_dim, heads)
+        free(tb_out)
+        tb_out = tb_next
+        ti = ti + 1
+    }
 
     // proj_out (batched Linear: channels → channels for all seq positions)
     w_pout_w, _ := st_tensor(prefix + ".proj_out.weight")
@@ -261,4 +270,62 @@ func attention_block(out, in_buf, context, prefix, channels, h, w_dim, ctx_seq, 
     // Reshape [H*W, C] → [C, H, W] (transpose back) and add residual — GPU builtin
     transpose_add_chw_f32(out, in_buf, proj_out_out, channels, h, w_dim)
     free(proj_out_out)
+}
+
+// ResNet block for up blocks (input channels may differ from output channels)
+// The first conv1 takes in_ch → ch, second conv2 takes ch → ch
+func resnet_block_up(out, in_buf, prefix, ch, in_ch, h, w_dim, temb, temb_dim) {
+    // Ensure in_buf is on host (needed for residual axpy later)
+    ocl_sync()
+    // norm1 operates over in_ch channels, so tmp must hold in_ch channels
+    tmp := alloc(in_ch * h * w_dim * 4)
+
+    // norm1 + SiLU (fused GPU kernel)
+    w_n1w, _ := st_tensor(prefix + ".norm1.weight")
+    w_n1b, _ := st_tensor(prefix + ".norm1.bias")
+    group_norm_silu_f32(tmp, in_buf, w_n1w, w_n1b, in_ch, h, w_dim, 32, 0.00001)
+
+    // conv1: in_ch → ch (3×3, pad=1)
+    w_c1w, _ := st_tensor(prefix + ".conv1.weight")
+    w_c1b, _ := st_tensor(prefix + ".conv1.bias")
+    conv2d(out, tmp, w_c1w, w_c1b, in_ch, ch, h, w_dim, 3, 3, 1, 1)
+    free(tmp)
+
+    // Time embedding projection
+    w_tepw, _ := st_tensor(prefix + ".time_emb_proj.weight")
+    w_tepb, _ := st_tensor(prefix + ".time_emb_proj.bias")
+    temb_proj := alloc(ch * 4)
+    temb_silu := alloc(temb_dim * 4)
+    copy_buf(temb_silu, temb, temb_dim)
+    silu_buf(temb_silu, temb_dim)
+    linear(temb_proj, w_tepw, w_tepb, temb_silu, temb_dim, ch)
+    free(temb_silu)
+
+    // Add temb_proj to each spatial position (GPU broadcast add)
+    add_vec_spatial_f32(out, temb_proj, ch, h * w_dim)
+    free(temb_proj)
+
+    // norm2 + SiLU (fused GPU kernel)
+    tmp2 := alloc(ch * h * w_dim * 4)
+    w_n2w, _ := st_tensor(prefix + ".norm2.weight")
+    w_n2b, _ := st_tensor(prefix + ".norm2.bias")
+    group_norm_silu_f32(tmp2, out, w_n2w, w_n2b, ch, h, w_dim, 32, 0.00001)
+
+    // conv2: ch → ch
+    w_c2w, _ := st_tensor(prefix + ".conv2.weight")
+    w_c2b, _ := st_tensor(prefix + ".conv2.bias")
+    conv2d(out, tmp2, w_c2w, w_c2b, ch, ch, h, w_dim, 3, 3, 1, 1)
+    free(tmp2)
+
+    // Residual: need conv_shortcut if in_ch != ch — use axpy_f32 (vectorized)
+    if in_ch != ch {
+        w_sc_w, _ := st_tensor(prefix + ".conv_shortcut.weight")
+        w_sc_b, _ := st_tensor(prefix + ".conv_shortcut.bias")
+        shortcut := alloc(ch * h * w_dim * 4)
+        conv2d(shortcut, in_buf, w_sc_w, w_sc_b, in_ch, ch, h, w_dim, 1, 1, 0, 1)
+        axpy_f32(out, 1.0, shortcut, ch * h * w_dim)
+        free(shortcut)
+    } else {
+        axpy_f32(out, 1.0, in_buf, ch * h * w_dim)
+    }
 }

@@ -1,0 +1,269 @@
+// unet_sdxl.src — SDXL-Lightning UNet forward pass
+// Architecture: UNet2DConditionModel (SDXL)
+//   block_out_channels: [320, 640, 1280] — 3 levels
+//   attention_head_dim: [5, 10, 20] → head_dim=64
+//   cross_attention_dim: 2048 (dual text encoder concat)
+//   transformer_layers_per_block: [1, 2, 10]
+//   layers_per_block: 2 (down), 3 (up)
+//   addition_embed_type: text_time (pooled text + add_time_ids)
+//   addition_time_embed_dim: 256
+//   sample_size: 128 (1024x1024 → latent 128x128)
+//   4-step generation (SDXL-Lightning)
+
+var sdxl_unet_channels = []int{320, 640, 1280}
+var sdxl_unet_heads = []int{5, 10, 20}
+var sdxl_unet_transformers = []int{1, 2, 10}
+var sdxl_unet_cross_dim = 2048
+var sdxl_unet_sample_size = 128
+var sdxl_unet_add_time_dim = 256
+
+// Sinusoidal embedding (dim N, flip_sin_to_cos=true)
+func sdxl_sinusoidal(timestep, dim) (emb) {
+    half := dim / 2
+    emb = alloc(dim * 4)
+    i := 0
+    while i < half {
+        freq := 1.0 / pow(10000.0, float(i) / float(half))
+        arg := float(timestep) * freq
+        poke_f32(emb, i * 4, cos(arg))
+        poke_f32(emb, (i + half) * 4, sin(arg))
+        i = i + 1
+    }
+}
+
+// Time embedding: sinusoidal(320) → linear(320→1280) + SiLU + linear(1280→1280)
+func sdxl_unet_time_embedding(timestep) (temb) {
+    emb := sdxl_sinusoidal(timestep, 320)
+    w_l1w, _ := st_tensor("time_embedding.linear_1.weight")
+    w_l1b, _ := st_tensor("time_embedding.linear_1.bias")
+    tmp := alloc(1280 * 4)
+    linear(tmp, w_l1w, w_l1b, emb, 320, 1280)
+    silu_buf(tmp, 1280)
+    free(emb)
+    w_l2w, _ := st_tensor("time_embedding.linear_2.weight")
+    w_l2b, _ := st_tensor("time_embedding.linear_2.bias")
+    temb = alloc(1280 * 4)
+    linear(temb, w_l2w, w_l2b, tmp, 1280, 1280)
+    free(tmp)
+}
+
+// Additional embedding: text_time (pooled text + 6 add_time_ids)
+// add_time_ids: [orig_h, orig_w, crop_top, crop_left, target_h, target_w]
+// Each gets sinusoidal(256), concatenated → 1536
+// Concat with pooled_text(1280) → 2816 → linear_1(2816→1280) + SiLU + linear_2(1280→1280)
+func sdxl_unet_add_embedding(pooled_text) (aug_emb) {
+    // 6 add_time_ids, each → 256 dim sinusoidal
+    add_time_ids := []int{1024, 1024, 0, 0, 1024, 1024}
+    time_emb := alloc(6 * sdxl_unet_add_time_dim * 4)
+    i := 0
+    while i < 6 {
+        se := sdxl_sinusoidal(add_time_ids[i], sdxl_unet_add_time_dim)
+        copy_buf(time_emb + i * sdxl_unet_add_time_dim * 4, se, sdxl_unet_add_time_dim)
+        free(se)
+        i = i + 1
+    }
+
+    // Concat: [pooled_text(1280), time_emb(1536)] → 2816
+    concat := alloc(2816 * 4)
+    copy_buf(concat, pooled_text, 1280)
+    copy_buf(concat + 1280 * 4, time_emb, 1536)
+    free(time_emb)
+
+    // linear_1: 2816 → 1280 + SiLU
+    w_l1w, _ := st_tensor("add_embedding.linear_1.weight")
+    w_l1b, _ := st_tensor("add_embedding.linear_1.bias")
+    tmp := alloc(1280 * 4)
+    linear(tmp, w_l1w, w_l1b, concat, 2816, 1280)
+    free(concat)
+    silu_buf(tmp, 1280)
+
+    // linear_2: 1280 → 1280
+    w_l2w, _ := st_tensor("add_embedding.linear_2.weight")
+    w_l2b, _ := st_tensor("add_embedding.linear_2.bias")
+    aug_emb = alloc(1280 * 4)
+    linear(aug_emb, w_l2w, w_l2b, tmp, 1280, 1280)
+    free(tmp)
+}
+
+// SDXL UNet forward pass
+// latent: [4, 128, 128] fp32
+// context: [77, 2048] fp32 (dual text encoder concat)
+// pooled: [1280] fp32 (TE2 pooled + text_projection)
+// timestep: int
+func unet_sdxl_forward(latent, context, pooled, timestep) (output) {
+    h := sdxl_unet_sample_size
+    w := sdxl_unet_sample_size
+
+    // 1. Time embedding + additional embedding
+    temb := sdxl_unet_time_embedding(timestep)
+    aug := sdxl_unet_add_embedding(pooled)
+    axpy_f32(temb, 1.0, aug, 1280)
+    free(aug)
+
+    // 2. conv_in: 4 → 320
+    w_cin_w, _ := st_tensor("conv_in.weight")
+    w_cin_b, _ := st_tensor("conv_in.bias")
+    x := alloc(320 * h * w * 4)
+    conv2d(x, latent, w_cin_w, w_cin_b, 4, 320, h, w, 3, 3, 1, 1)
+
+    // Skip connections
+    skips := []int{}
+    ocl_sync()
+    skip0 := alloc(320 * h * w * 4)
+    copy_buf(skip0, x, 320 * h * w)
+    skips = append(skips, skip0)
+
+    // 3. Down blocks (3 levels)
+    db := 0
+    while db < 3 {
+        ch := sdxl_unet_channels[db]
+        heads := sdxl_unet_heads[db]
+        n_tf := sdxl_unet_transformers[db]
+        has_attn := db > 0  // down_blocks.0 is DownBlock2D (no attention)
+
+        l := 0
+        while l < 2 {
+            res_out := alloc(ch * h * w * 4)
+            if l == 0 && db > 0 {
+                prev_ch := sdxl_unet_channels[db - 1]
+                resnet_block_ch(res_out, x, "down_blocks." + str(db) + ".resnets." + str(l), prev_ch, ch, h, w, temb, 1280)
+            } else {
+                resnet_block(res_out, x, "down_blocks." + str(db) + ".resnets." + str(l), ch, h, w, temb, 1280)
+            }
+            free(x)
+            x = res_out
+
+            if has_attn {
+                att_out := alloc(ch * h * w * 4)
+                attention_block(att_out, x, context, "down_blocks." + str(db) + ".attentions." + str(l), ch, h, w, 77, sdxl_unet_cross_dim, heads, n_tf)
+                free(x)
+                x = att_out
+            }
+
+            ocl_sync()
+            skip_copy := alloc(ch * h * w * 4)
+            copy_buf(skip_copy, x, ch * h * w)
+            skips = append(skips, skip_copy)
+            l = l + 1
+        }
+
+        // Downsampler (except last block)
+        if db < 2 {
+            w_ds_w, _ := st_tensor("down_blocks." + str(db) + ".downsamplers.0.conv.weight")
+            w_ds_b, _ := st_tensor("down_blocks." + str(db) + ".downsamplers.0.conv.bias")
+            ds_out := alloc(ch * (h / 2) * (w / 2) * 4)
+            conv2d(ds_out, x, w_ds_w, w_ds_b, ch, ch, h, w, 3, 3, 1, 2)
+            free(x)
+            x = ds_out
+            ocl_sync()
+            skip_copy = alloc(ch * (h / 2) * (w / 2) * 4)
+            copy_buf(skip_copy, x, ch * (h / 2) * (w / 2))
+            skips = append(skips, skip_copy)
+            h = h / 2
+            w = w / 2
+        }
+        db = db + 1
+    }
+
+    // 4. Mid block (resnet + attention(10 tf) + resnet)
+    mid_res0 := alloc(1280 * h * w * 4)
+    resnet_block(mid_res0, x, "mid_block.resnets.0", 1280, h, w, temb, 1280)
+    free(x)
+    x = mid_res0
+
+    mid_att := alloc(1280 * h * w * 4)
+    attention_block(mid_att, x, context, "mid_block.attentions.0", 1280, h, w, 77, sdxl_unet_cross_dim, 20, 10)
+    free(x)
+    x = mid_att
+
+    mid_res1 := alloc(1280 * h * w * 4)
+    resnet_block(mid_res1, x, "mid_block.resnets.1", 1280, h, w, temb, 1280)
+    free(x)
+    x = mid_res1
+
+    // 5. Up blocks (3 levels, reverse order)
+    skip_idx := len(skips) - 1
+    ub := 0
+    while ub < 3 {
+        // Up block index maps to down block in reverse: ub=0 → db=2, ub=1 → db=1, ub=2 → db=0
+        db_match := 2 - ub
+        ch := sdxl_unet_channels[db_match]
+        heads := sdxl_unet_heads[db_match]
+        n_tf := sdxl_unet_transformers[db_match]
+        has_attn := db_match > 0  // up_blocks.2 (matching down_blocks.0) has no attention
+
+        // Current input channels
+        x_ch := 1280
+        if ub == 1 { x_ch = 1280 }
+        if ub == 2 { x_ch = 640 }
+
+        l := 0
+        while l < 3 {
+            skip := skips[skip_idx]
+            skip_idx = skip_idx - 1
+
+            conv1_shape := st_shape("up_blocks." + str(ub) + ".resnets." + str(l) + ".conv1.weight")
+            in_ch := conv1_shape[1]
+            skip_ch := in_ch - x_ch
+
+            ocl_sync()
+            cat := alloc(in_ch * h * w * 4)
+            concat_chw_f32(cat, x, skip, x_ch, skip_ch, h * w)
+            free(skip)
+
+            res_out := alloc(ch * h * w * 4)
+            resnet_block_up(res_out, cat, "up_blocks." + str(ub) + ".resnets." + str(l), ch, in_ch, h, w, temb, 1280)
+            free(cat)
+            free(x)
+            x = res_out
+            x_ch = ch
+
+            if has_attn {
+                att_out := alloc(ch * h * w * 4)
+                attention_block(att_out, x, context, "up_blocks." + str(ub) + ".attentions." + str(l), ch, h, w, 77, sdxl_unet_cross_dim, heads, n_tf)
+                free(x)
+                x = att_out
+            }
+            l = l + 1
+        }
+
+        // Upsampler (except last block)
+        if ub < 2 {
+            up_h := h * 2
+            up_w := w * 2
+            ocl_sync()
+            upsampled := alloc(ch * up_h * up_w * 4)
+            upsample_nearest(upsampled, x, ch, h, w)
+            w_up_w, _ := st_tensor("up_blocks." + str(ub) + ".upsamplers.0.conv.weight")
+            w_up_b, _ := st_tensor("up_blocks." + str(ub) + ".upsamplers.0.conv.bias")
+            up_out := alloc(ch * up_h * up_w * 4)
+            conv2d(up_out, upsampled, w_up_w, w_up_b, ch, ch, up_h, up_w, 3, 3, 1, 1)
+            free(upsampled)
+            free(x)
+            x = up_out
+            h = up_h
+            w = up_w
+        }
+        ub = ub + 1
+    }
+
+    // 6. conv_norm_out + SiLU
+    w_cno_w, _ := st_tensor("conv_norm_out.weight")
+    w_cno_b, _ := st_tensor("conv_norm_out.bias")
+    normed := alloc(320 * h * w * 4)
+    group_norm_silu_f32(normed, x, w_cno_w, w_cno_b, 320, h, w, 32, 0.00001)
+    free(x)
+
+    // 7. conv_out: 320 → 4
+    w_cout_w, _ := st_tensor("conv_out.weight")
+    w_cout_b, _ := st_tensor("conv_out.bias")
+    output = alloc(4 * h * w * 4)
+    conv2d(output, normed, w_cout_w, w_cout_b, 320, 4, h, w, 3, 3, 1, 1)
+    free(normed)
+    ocl_sync()
+
+    for _, s := range skips {
+        if skip_idx >= 0 && s != 0 { free(s) }
+    }
+    free(temb)
+}

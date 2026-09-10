@@ -1,0 +1,290 @@
+var st_buf=0
+
+var st_data_base=0
+
+var st_buf_owned=0
+
+func st_close(){if st_buf_owned==1&&st_buf!=0{free(st_buf)}st_buf=0 st_data_base=0 st_buf_owned=0 st_index=[]TensorIdx{}for k:=range st_index_map{delete(st_index_map,k)}}
+
+type TensorIdx struct{name string start int end int ndims int dims[]int}
+
+var st_index=[]TensorIdx{}
+
+var st_index_map=make(map[string]int)
+
+func read_u64_ptr(p,off)(v){v=0 i:=0 while i<8{v=v|(peek_u8(p,off+i)<<(i*8))i=i+1}return}
+
+func parse_idx_line(line)(idx,ok){ok=0 parts:=split(line,"\t")if len(parts)<5{return}idx.name=parts[0]idx.start=parse_int(parts[1])idx.end=parse_int(parts[2])idx.ndims=parse_int(parts[3])dimParts:=split(parts[4],",")for _,d:=range dimParts{idx.dims=append(idx.dims,parse_int(d))}ok=1 return}
+
+func st_open(path){idxPath:=path+".idx" idxText:=read_file(idxPath)if len(idxText)==0{println("st_open: cannot read "+idxPath)exit(1)}lines:=split(idxText,"\n")for _,line:=range lines{if len(line)==0{continue}entry,ok:=parse_idx_line(line)if ok==1{st_index=append(st_index,entry)st_index_map[entry.name]=len(st_index)-1}}p,n:=mmap_file(path)if p!=0{st_buf=p st_buf_owned=0 println("  mmap ok: "+str(n)+" bytes")}else{println("  mmap failed, reading file into memory...")maxEnd:=0 for _,entry:=range st_index{if entry.end>maxEnd{maxEnd=entry.end}}hdr:=alloc(8)read_file_raw(path,hdr,8)hlen2:=read_u64_ptr(hdr,0)free(hdr)totalSize:=8+hlen2+maxEnd println("  allocating "+str(totalSize)+" bytes...")st_buf=alloc(totalSize)if st_buf==0{println("st_open: alloc failed for "+path)exit(1)}st_buf_owned=1 println("  reading file...")got:=read_file_raw(path,st_buf,totalSize)if got<0{println("st_open: cannot read "+path)exit(1)}println("  read "+str(got)+" bytes")}hlen:=read_u64_ptr(st_buf,0)st_data_base=8+hlen}
+
+func st_tensor(name)(ptr,nfloats){if!has(st_index_map,name){println("st_tensor: "+name+" not found")return 0,0}idx:=st_index_map[name]entry:=st_index[idx]ptr=st_buf+st_data_base+entry.start nfloats=(entry.end-entry.start)/4 return}
+
+func st_shape(name)(dims){if!has(st_index_map,name){return[]int{}}idx:=st_index_map[name]dims=st_index[idx].dims return}
+
+var clip_hidden=1024
+
+var clip_n_heads=16
+
+var clip_head_dim=64
+
+var clip_n_layers=23
+
+var clip_intermediate=4096
+
+var clip_vocab=49408
+
+var clip_max_pos=77
+
+var clip_eps=0.00001
+
+var clip_w_tok_emb=0
+
+var clip_w_pos_emb=0
+
+var clip_w_final_ln_w=0
+
+var clip_w_final_ln_b=0
+
+var clip_w_ln1_w=[]int{}
+
+var clip_w_ln1_b=[]int{}
+
+var clip_w_ln2_w=[]int{}
+
+var clip_w_ln2_b=[]int{}
+
+var clip_w_q_w=[]int{}
+
+var clip_w_q_b=[]int{}
+
+var clip_w_k_w=[]int{}
+
+var clip_w_k_b=[]int{}
+
+var clip_w_v_w=[]int{}
+
+var clip_w_v_b=[]int{}
+
+var clip_w_o_w=[]int{}
+
+var clip_w_o_b=[]int{}
+
+var clip_w_fc1_w=[]int{}
+
+var clip_w_fc1_b=[]int{}
+
+var clip_w_fc2_w=[]int{}
+
+var clip_w_fc2_b=[]int{}
+
+var clip_x=0
+
+var clip_xb=0
+
+var clip_q=0
+
+var clip_k=0
+
+var clip_v=0
+
+var clip_att=0
+
+var clip_attout=0
+
+var clip_hb=0
+
+var clip_hb2=0
+
+func clip_load(){p,_:=st_tensor("text_model.embeddings.token_embedding.weight")clip_w_tok_emb=p p,_=st_tensor("text_model.embeddings.position_embedding.weight")clip_w_pos_emb=p p,_=st_tensor("text_model.final_layer_norm.weight")clip_w_final_ln_w=p p,_=st_tensor("text_model.final_layer_norm.bias")clip_w_final_ln_b=p i:=0 while i<clip_n_layers{prefix:="text_model.encoder.layers."+str(i)+"." p,_=st_tensor(prefix+"layer_norm1.weight")clip_w_ln1_w=append(clip_w_ln1_w,p)p,_=st_tensor(prefix+"layer_norm1.bias")clip_w_ln1_b=append(clip_w_ln1_b,p)p,_=st_tensor(prefix+"layer_norm2.weight")clip_w_ln2_w=append(clip_w_ln2_w,p)p,_=st_tensor(prefix+"layer_norm2.bias")clip_w_ln2_b=append(clip_w_ln2_b,p)p,_=st_tensor(prefix+"self_attn.q_proj.weight")clip_w_q_w=append(clip_w_q_w,p)p,_=st_tensor(prefix+"self_attn.q_proj.bias")clip_w_q_b=append(clip_w_q_b,p)p,_=st_tensor(prefix+"self_attn.k_proj.weight")clip_w_k_w=append(clip_w_k_w,p)p,_=st_tensor(prefix+"self_attn.k_proj.bias")clip_w_k_b=append(clip_w_k_b,p)p,_=st_tensor(prefix+"self_attn.v_proj.weight")clip_w_v_w=append(clip_w_v_w,p)p,_=st_tensor(prefix+"self_attn.v_proj.bias")clip_w_v_b=append(clip_w_v_b,p)p,_=st_tensor(prefix+"self_attn.out_proj.weight")clip_w_o_w=append(clip_w_o_w,p)p,_=st_tensor(prefix+"self_attn.out_proj.bias")clip_w_o_b=append(clip_w_o_b,p)p,_=st_tensor(prefix+"mlp.fc1.weight")clip_w_fc1_w=append(clip_w_fc1_w,p)p,_=st_tensor(prefix+"mlp.fc1.bias")clip_w_fc1_b=append(clip_w_fc1_b,p)p,_=st_tensor(prefix+"mlp.fc2.weight")clip_w_fc2_w=append(clip_w_fc2_w,p)p,_=st_tensor(prefix+"mlp.fc2.bias")clip_w_fc2_b=append(clip_w_fc2_b,p)i=i+1}}
+
+func clip_alloc(){clip_x=alloc(clip_max_pos*clip_hidden*4)clip_xb=alloc(clip_hidden*4)clip_q=alloc(clip_max_pos*clip_hidden*4)clip_k=alloc(clip_max_pos*clip_hidden*4)clip_v=alloc(clip_max_pos*clip_hidden*4)clip_att=alloc(clip_max_pos*clip_n_heads*clip_max_pos*4)clip_attout=alloc(clip_max_pos*clip_hidden*4)clip_hb=alloc(clip_max_pos*clip_intermediate*4)clip_hb2=alloc(clip_max_pos*clip_hidden*4)}
+
+func layer_norm(out,x,w,b,n){mean:=0.0 i:=0 while i<n{mean=mean+peek_f32(x,i*4)i=i+1}mean=mean/float(n)var_val:=0.0 i=0 while i<n{d:=peek_f32(x,i*4)-mean var_val=var_val+d*d i=i+1}var_val=var_val/float(n)inv:=1.0/sqrt(var_val+clip_eps)i=0 while i<n{poke_f32(out,i*4,(peek_f32(x,i*4)-mean)*inv*peek_f32(w,i*4)+peek_f32(b,i*4))i=i+1}}
+
+func gelu(x)(r){z:=1.702*x if z>20.0{r=x  return}if z<0.0-20.0{r=0.0  return}r=x/(1.0+exp(0.0-z))return}
+
+func tanh_approx(x)(r){if x>20.0{r=1.0  return}if x<0.0-20.0{r=0.0-1.0  return}e:=exp(2.0*x)r=(e-1.0)/(e+1.0)return}
+
+func linear(out,w,b,x,in_n,out_n){matmul_f32(out,x,w,b,in_n,out_n,1)ocl_sync()}
+
+func linear_batch(out,w,b,x,in_n,out_n,batch){matmul_f32(out,x,w,b,in_n,out_n,batch)ocl_sync()}
+
+func layer_norm_batch(out,x,w,b,batch,n){pos:=0 while pos<batch{row_out:=out+pos*n*4 row_x:=x+pos*n*4 layer_norm(row_out,row_x,w,b,n)pos=pos+1}}
+
+func linear_no_bias(out,w,x,in_n,out_n){matmul_f32(out,x,w,0,in_n,out_n,1)ocl_sync()}
+
+func attention_head(out_buf,q_buf,k_buf,v_buf,seq,head){hd:=clip_head_dim scale:=1.0/sqrt(float(hd))q_off:=head*hd i:=0 while i<seq{scores:=clip_att+(i*clip_n_heads*clip_max_pos+head*clip_max_pos)*4 mx:=0.0-1e30 cutoff:=i+1 j:=0 while j<cutoff{dot:=dot_f32(q_buf+(i*clip_hidden+q_off)*4,k_buf+(j*clip_hidden+q_off)*4,hd)dot=dot*scale poke_f32(scores,j*4,dot)if dot>mx{mx=dot}j=j+1}sum:=0.0 j=0 while j<cutoff{e:=exp(peek_f32(scores,j*4)-mx)poke_f32(scores,j*4,e)sum=sum+e j=j+1}inv_sum:=1.0/sum j=0 while j<cutoff{poke_f32(scores,j*4,peek_f32(scores,j*4)*inv_sum)j=j+1}d:=0 while d<hd{poke_f32(out_buf,(i*clip_hidden+q_off+d)*4,0.0)d=d+1}j=0 while j<cutoff{s:=peek_f32(scores,j*4)axpy_f32(out_buf+(i*clip_hidden+q_off)*4,s,v_buf+(j*clip_hidden+q_off)*4,hd)j=j+1}i=i+1}}
+
+func clip_forward(token_ids,seq){pos:=0 while pos<seq{tid:=token_ids[pos]src:=clip_w_tok_emb+tid*clip_hidden*4 dst:=clip_x+pos*clip_hidden*4 i:=0 while i<clip_hidden{poke_f32(dst,i*4,peek_f32(src,i*4)+peek_f32(clip_w_pos_emb,pos*clip_hidden*4+i*4))i=i+1}pos=pos+1}layer:=0 while layer<clip_n_layers{ln_out:=alloc(clip_max_pos*clip_hidden*4)layer_norm_batch(ln_out,clip_x,clip_w_ln1_w[layer],clip_w_ln1_b[layer],seq,clip_hidden)linear_batch(clip_q,clip_w_q_w[layer],clip_w_q_b[layer],ln_out,clip_hidden,clip_hidden,seq)linear_batch(clip_k,clip_w_k_w[layer],clip_w_k_b[layer],ln_out,clip_hidden,clip_hidden,seq)linear_batch(clip_v,clip_w_v_w[layer],clip_w_v_b[layer],ln_out,clip_hidden,clip_hidden,seq)free(ln_out)pos=0 while pos<seq*clip_hidden{poke_f32(clip_attout,pos*4,0.0)pos=pos+1}head:=0 while head<clip_n_heads{head_out:=alloc(seq*clip_hidden*4)j:=0 while j<seq*clip_hidden{poke_f32(head_out,j*4,0.0)j=j+1}attention_head(head_out,clip_q,clip_k,clip_v,seq,head)j=0 while j<seq*clip_hidden{poke_f32(clip_attout,j*4,peek_f32(clip_attout,j*4)+peek_f32(head_out,j*4))j=j+1}free(head_out)head=head+1}proj_out:=alloc(clip_max_pos*clip_hidden*4)linear_batch(proj_out,clip_w_o_w[layer],clip_w_o_b[layer],clip_attout,clip_hidden,clip_hidden,seq)pos=0 while pos<seq{xrow:=clip_x+pos*clip_hidden*4 prow:=proj_out+pos*clip_hidden*4 i:=0 while i<clip_hidden{poke_f32(xrow,i*4,peek_f32(xrow,i*4)+peek_f32(prow,i*4))i=i+1}pos=pos+1}free(proj_out)ln2_out:=alloc(clip_max_pos*clip_hidden*4)layer_norm_batch(ln2_out,clip_x,clip_w_ln2_w[layer],clip_w_ln2_b[layer],seq,clip_hidden)linear_batch(clip_hb,clip_w_fc1_w[layer],clip_w_fc1_b[layer],ln2_out,clip_hidden,clip_intermediate,seq)free(ln2_out)i:=0 while i<seq*clip_intermediate{poke_f32(clip_hb,i*4,gelu(peek_f32(clip_hb,i*4)))i=i+1}linear_batch(clip_hb2,clip_w_fc2_w[layer],clip_w_fc2_b[layer],clip_hb,clip_intermediate,clip_hidden,seq)pos=0 while pos<seq{xrow:=clip_x+pos*clip_hidden*4 hrow:=clip_hb2+pos*clip_hidden*4 i=0 while i<clip_hidden{poke_f32(xrow,i*4,peek_f32(xrow,i*4)+peek_f32(hrow,i*4))i=i+1}pos=pos+1}layer=layer+1}pos=0 while pos<seq{xrow:=clip_x+pos*clip_hidden*4 layer_norm(xrow,xrow,clip_w_final_ln_w,clip_w_final_ln_b,clip_hidden)pos=pos+1}}
+
+var sdxl_te1_hidden=768
+
+var sdxl_te1_heads=12
+
+var sdxl_te1_layers=12
+
+var sdxl_te1_inter=3072
+
+var sdxl_te2_hidden=1280
+
+var sdxl_te2_heads=20
+
+var sdxl_te2_layers=32
+
+var sdxl_te2_inter=5120
+
+var sdxl_max_pos=77
+
+var sdxl_eps=0.00001
+
+var sdxl_cur_hidden=0
+
+var sdxl_cur_heads=0
+
+var sdxl_cur_layers=0
+
+var sdxl_cur_inter=0
+
+var sdxl_cur_act=0
+
+var sdxl_w_tok=0
+
+var sdxl_w_pos=0
+
+var sdxl_w_fln_w=0
+
+var sdxl_w_fln_b=0
+
+var sdxl_w_ln1_w=[]int{}
+
+var sdxl_w_ln1_b=[]int{}
+
+var sdxl_w_ln2_w=[]int{}
+
+var sdxl_w_ln2_b=[]int{}
+
+var sdxl_w_q_w=[]int{}
+
+var sdxl_w_q_b=[]int{}
+
+var sdxl_w_k_w=[]int{}
+
+var sdxl_w_k_b=[]int{}
+
+var sdxl_w_v_w=[]int{}
+
+var sdxl_w_v_b=[]int{}
+
+var sdxl_w_o_w=[]int{}
+
+var sdxl_w_o_b=[]int{}
+
+var sdxl_w_fc1_w=[]int{}
+
+var sdxl_w_fc1_b=[]int{}
+
+var sdxl_w_fc2_w=[]int{}
+
+var sdxl_w_fc2_b=[]int{}
+
+var sdxl_w_text_proj_w=0
+
+func gelu_tanh(x)(r){if x>20.0{r=x  return}if x<0.0-20.0{r=0.0  return}c:=0.7978845608*(x+0.044715*x*x*x)r=0.5*x*(1.0+tanh_approx(c))return}
+
+func sdxl_gelu(x)(r){if sdxl_cur_act==0{r=gelu(x)return}r=gelu_tanh(x)return}
+
+func clip_sdxl_load_te(prefix){sdxl_w_tok=0  sdxl_w_pos=0  sdxl_w_fln_w=0  sdxl_w_fln_b=0 sdxl_w_ln1_w=[]int{}sdxl_w_ln1_b=[]int{}sdxl_w_ln2_w=[]int{}sdxl_w_ln2_b=[]int{}sdxl_w_q_w=[]int{}sdxl_w_q_b=[]int{}sdxl_w_k_w=[]int{}sdxl_w_k_b=[]int{}sdxl_w_v_w=[]int{}sdxl_w_v_b=[]int{}sdxl_w_o_w=[]int{}sdxl_w_o_b=[]int{}sdxl_w_fc1_w=[]int{}sdxl_w_fc1_b=[]int{}sdxl_w_fc2_w=[]int{}sdxl_w_fc2_b=[]int{}sdxl_w_text_proj_w=0 p,_:=st_tensor(prefix+"text_model.embeddings.token_embedding.weight")sdxl_w_tok=p p,_=st_tensor(prefix+"text_model.embeddings.position_embedding.weight")sdxl_w_pos=p p,_=st_tensor(prefix+"text_model.final_layer_norm.weight")sdxl_w_fln_w=p p,_=st_tensor(prefix+"text_model.final_layer_norm.bias")sdxl_w_fln_b=p i:=0 while i<sdxl_cur_layers{lp:="text_model.encoder.layers."+str(i)+"." p,_=st_tensor(prefix+lp+"layer_norm1.weight")sdxl_w_ln1_w=append(sdxl_w_ln1_w,p)p,_=st_tensor(prefix+lp+"layer_norm1.bias")sdxl_w_ln1_b=append(sdxl_w_ln1_b,p)p,_=st_tensor(prefix+lp+"layer_norm2.weight")sdxl_w_ln2_w=append(sdxl_w_ln2_w,p)p,_=st_tensor(prefix+lp+"layer_norm2.bias")sdxl_w_ln2_b=append(sdxl_w_ln2_b,p)p,_=st_tensor(prefix+lp+"self_attn.q_proj.weight")sdxl_w_q_w=append(sdxl_w_q_w,p)p,_=st_tensor(prefix+lp+"self_attn.q_proj.bias")sdxl_w_q_b=append(sdxl_w_q_b,p)p,_=st_tensor(prefix+lp+"self_attn.k_proj.weight")sdxl_w_k_w=append(sdxl_w_k_w,p)p,_=st_tensor(prefix+lp+"self_attn.k_proj.bias")sdxl_w_k_b=append(sdxl_w_k_b,p)p,_=st_tensor(prefix+lp+"self_attn.v_proj.weight")sdxl_w_v_w=append(sdxl_w_v_w,p)p,_=st_tensor(prefix+lp+"self_attn.v_proj.bias")sdxl_w_v_b=append(sdxl_w_v_b,p)p,_=st_tensor(prefix+lp+"self_attn.out_proj.weight")sdxl_w_o_w=append(sdxl_w_o_w,p)p,_=st_tensor(prefix+lp+"self_attn.out_proj.bias")sdxl_w_o_b=append(sdxl_w_o_b,p)p,_=st_tensor(prefix+lp+"mlp.fc1.weight")sdxl_w_fc1_w=append(sdxl_w_fc1_w,p)p,_=st_tensor(prefix+lp+"mlp.fc1.bias")sdxl_w_fc1_b=append(sdxl_w_fc1_b,p)p,_=st_tensor(prefix+lp+"mlp.fc2.weight")sdxl_w_fc2_w=append(sdxl_w_fc2_w,p)p,_=st_tensor(prefix+lp+"mlp.fc2.bias")sdxl_w_fc2_b=append(sdxl_w_fc2_b,p)i=i+1}tp,tp_ok:=st_tensor(prefix+"text_projection.weight")if tp_ok>0{sdxl_w_text_proj_w=tp}}
+
+var sdxl_x=0
+
+var sdxl_q=0
+
+var sdxl_k=0
+
+var sdxl_v=0
+
+var sdxl_hb=0
+
+var sdxl_hb2=0
+
+func clip_sdxl_forward_te(token_ids,seq)(pooled_out){h:=sdxl_cur_hidden hd:=h/sdxl_cur_heads inter:=sdxl_cur_inter sdxl_x=alloc(sdxl_max_pos*h*4)sdxl_q=alloc(sdxl_max_pos*h*4)sdxl_k=alloc(sdxl_max_pos*h*4)sdxl_v=alloc(sdxl_max_pos*h*4)sdxl_hb=alloc(sdxl_max_pos*inter*4)sdxl_hb2=alloc(sdxl_max_pos*h*4)pos:=0 while pos<seq{tid:=token_ids[pos]src:=sdxl_w_tok+tid*h*4 dst:=sdxl_x+pos*h*4 i:=0 while i<h{poke_f32(dst,i*4,peek_f32(src,i*4)+peek_f32(sdxl_w_pos,pos*h*4+i*4))i=i+1}pos=pos+1}layer:=0 while layer<sdxl_cur_layers{ocl_sync()ln_out:=alloc(seq*h*4)layer_norm_batch(ln_out,sdxl_x,sdxl_w_ln1_w[layer],sdxl_w_ln1_b[layer],seq,h)matmul_f32(sdxl_q,ln_out,sdxl_w_q_w[layer],sdxl_w_q_b[layer],h,h,seq)matmul_f32(sdxl_k,ln_out,sdxl_w_k_w[layer],sdxl_w_k_b[layer],h,h,seq)matmul_f32(sdxl_v,ln_out,sdxl_w_v_w[layer],sdxl_w_v_b[layer],h,h,seq)ocl_sync()free(ln_out)attn_out:=alloc(seq*h*4)zero_buf(attn_out,seq*h)scale:=1.0/sqrt(float(hd))attention_causal_f32(sdxl_q,sdxl_k,sdxl_v,attn_out,seq,seq,h,sdxl_cur_heads,scale)ocl_sync()proj_out:=alloc(seq*h*4)matmul_f32(proj_out,attn_out,sdxl_w_o_w[layer],sdxl_w_o_b[layer],h,h,seq)ocl_sync()free(attn_out)axpy_f32(sdxl_x,1.0,proj_out,seq*h)ocl_sync()free(proj_out)ln2_out:=alloc(seq*h*4)layer_norm_batch(ln2_out,sdxl_x,sdxl_w_ln2_w[layer],sdxl_w_ln2_b[layer],seq,h)matmul_f32(sdxl_hb,ln2_out,sdxl_w_fc1_w[layer],sdxl_w_fc1_b[layer],h,inter,seq)ocl_sync()free(ln2_out)i:=0 while i<seq*inter{poke_f32(sdxl_hb,i*4,sdxl_gelu(peek_f32(sdxl_hb,i*4)))i=i+1}matmul_f32(sdxl_hb2,sdxl_hb,sdxl_w_fc2_w[layer],sdxl_w_fc2_b[layer],inter,h,seq)ocl_sync()axpy_f32(sdxl_x,1.0,sdxl_hb2,seq*h)ocl_sync()layer=layer+1}ocl_sync()pos=0 while pos<seq{xrow:=sdxl_x+pos*h*4 layer_norm(xrow,xrow,sdxl_w_fln_w,sdxl_w_fln_b,h)pos=pos+1}eos_pos:=0 max_id:=0 i:=0 while i<seq{if token_ids[i]>max_id{max_id=token_ids[i]eos_pos=i}i=i+1}pooled_out=alloc(h*4)i=0 while i<h{poke_f32(pooled_out,i*4,peek_f32(sdxl_x,eos_pos*h*4+i*4))i=i+1}}
+
+func clip_sdxl_forward(token_ids,seq)(context,pooled){sdxl_cur_hidden=sdxl_te1_hidden sdxl_cur_heads=sdxl_te1_heads sdxl_cur_layers=sdxl_te1_layers sdxl_cur_inter=sdxl_te1_inter sdxl_cur_act=0 st_open(modelDir+"/text_encoder/model.safetensors")clip_sdxl_load_te("")te1_pooled:=clip_sdxl_forward_te(token_ids,seq)te1_out:=alloc(sdxl_max_pos*sdxl_te1_hidden*4)copy_buf(te1_out,sdxl_x,sdxl_max_pos*sdxl_te1_hidden)if len(debugDir)>0{dump_raw(debugDir+"/te1_hidden.bin",sdxl_x,sdxl_max_pos*sdxl_te1_hidden)}free(sdxl_x)free(sdxl_q)free(sdxl_k)free(sdxl_v)free(sdxl_hb)free(sdxl_hb2)free(te1_pooled)st_close()sdxl_cur_hidden=sdxl_te2_hidden sdxl_cur_heads=sdxl_te2_heads sdxl_cur_layers=sdxl_te2_layers sdxl_cur_inter=sdxl_te2_inter sdxl_cur_act=1 st_open(modelDir+"/text_encoder_2/model.safetensors")clip_sdxl_load_te("")te2_pooled:=clip_sdxl_forward_te(token_ids,seq)te2_out:=alloc(sdxl_max_pos*sdxl_te2_hidden*4)copy_buf(te2_out,sdxl_x,sdxl_max_pos*sdxl_te2_hidden)if len(debugDir)>0{dump_raw(debugDir+"/te2_hidden.bin",sdxl_x,sdxl_max_pos*sdxl_te2_hidden)dump_raw(debugDir+"/te2_pooled_raw.bin",te2_pooled,sdxl_te2_hidden)}free(sdxl_x)free(sdxl_q)free(sdxl_k)free(sdxl_v)free(sdxl_hb)free(sdxl_hb2)pooled=alloc(sdxl_te2_hidden*4)if sdxl_w_text_proj_w!=0{matmul_f32(pooled,te2_pooled,sdxl_w_text_proj_w,0,sdxl_te2_hidden,sdxl_te2_hidden,1)ocl_sync()}else{copy_buf(pooled,te2_pooled,sdxl_te2_hidden)}if len(debugDir)>0{dump_raw(debugDir+"/pooled.bin",pooled,sdxl_te2_hidden)}free(te2_pooled)st_close()context=alloc(sdxl_max_pos*(sdxl_te1_hidden+sdxl_te2_hidden)*4)pos:=0 while pos<sdxl_max_pos{te1_row:=te1_out+pos*sdxl_te1_hidden*4 te2_row:=te2_out+pos*sdxl_te2_hidden*4 ctx_row:=context+pos*(sdxl_te1_hidden+sdxl_te2_hidden)*4 i:=0 while i<sdxl_te1_hidden{poke_f32(ctx_row,i*4,peek_f32(te1_row,i*4))i=i+1}i=0 while i<sdxl_te2_hidden{poke_f32(ctx_row,(sdxl_te1_hidden+i)*4,peek_f32(te2_row,i*4))i=i+1}pos=pos+1}free(te1_out)free(te2_out)}
+
+func conv2d(out,in_buf,w,b,c_in,c_out,h,w_dim,kh,kw,pad,stride){conv2d_f32(out,in_buf,w,b,c_in,c_out,h,w_dim,kh,kw,pad,stride)}
+
+func group_norm(out,in_buf,gamma,beta,c,h,w_dim,groups,eps){group_norm_f32(out,in_buf,gamma,beta,c,h,w_dim,groups,eps)}
+
+func silu_buf(buf,n){silu_f32(buf,n)}
+
+func upsample_nearest(out,in_buf,c,h,w_dim){h2:=h*2 w2:=w_dim*2 ci:=0 while ci<c{y:=0 while y<h2{sy:=y/2 x:=0 while x<w2{sx:=x/2 poke_f32(out,(ci*h2*w2+y*w2+x)*4,peek_f32(in_buf,(ci*h*w_dim+sy*w_dim+sx)*4))x=x+1}y=y+1}ci=ci+1}}
+
+func add_buf(dst,src,n){i:=0 while i<n{poke_f32(dst,i*4,peek_f32(dst,i*4)+peek_f32(src,i*4))i=i+1}}
+
+func copy_buf(dst,src,n){i:=0 while i<n{poke_f32(dst,i*4,peek_f32(src,i*4))i=i+1}}
+
+func zero_buf(buf,n){i:=0 while i<n{poke_f32(buf,i*4,0.0)i=i+1}}
+
+func resnet_block(out,in_buf,prefix,channels,h,w_dim,temb,temb_dim){resnet_block_ch(out,in_buf,prefix,channels,channels,h,w_dim,temb,temb_dim)}
+
+func resnet_block_ch(out,in_buf,prefix,in_ch,out_ch,h,w_dim,temb,temb_dim){ocl_sync()tmp:=alloc(in_ch*h*w_dim*4)w_n1w,_:=st_tensor(prefix+".norm1.weight")w_n1b,_:=st_tensor(prefix+".norm1.bias")group_norm_silu_f32(tmp,in_buf,w_n1w,w_n1b,in_ch,h,w_dim,32,0.00001)w_c1w,_:=st_tensor(prefix+".conv1.weight")w_c1b,_:=st_tensor(prefix+".conv1.bias")conv2d(out,tmp,w_c1w,w_c1b,in_ch,out_ch,h,w_dim,3,3,1,1)free(tmp)w_tepw,_:=st_tensor(prefix+".time_emb_proj.weight")w_tepb,_:=st_tensor(prefix+".time_emb_proj.bias")temb_proj:=alloc(out_ch*4)temb_silu:=alloc(temb_dim*4)copy_buf(temb_silu,temb,temb_dim)silu_buf(temb_silu,temb_dim)linear(temb_proj,w_tepw,w_tepb,temb_silu,temb_dim,out_ch)free(temb_silu)add_vec_spatial_f32(out,temb_proj,out_ch,h*w_dim)free(temb_proj)tmp2:=alloc(out_ch*h*w_dim*4)w_n2w,_:=st_tensor(prefix+".norm2.weight")w_n2b,_:=st_tensor(prefix+".norm2.bias")group_norm_silu_f32(tmp2,out,w_n2w,w_n2b,out_ch,h,w_dim,32,0.00001)w_c2w,_:=st_tensor(prefix+".conv2.weight")w_c2b,_:=st_tensor(prefix+".conv2.bias")conv2d(out,tmp2,w_c2w,w_c2b,out_ch,out_ch,h,w_dim,3,3,1,1)free(tmp2)if in_ch!=out_ch{w_sc_w,_:=st_tensor(prefix+".conv_shortcut.weight")w_sc_b,_:=st_tensor(prefix+".conv_shortcut.bias")shortcut:=alloc(out_ch*h*w_dim*4)conv2d(shortcut,in_buf,w_sc_w,w_sc_b,in_ch,out_ch,h,w_dim,1,1,0,1)axpy_f32(out,1.0,shortcut,out_ch*h*w_dim)free(shortcut)}else{axpy_f32(out,1.0,in_buf,out_ch*h*w_dim)}}
+
+func spatial_attention(out,hidden_states,context,prefix,seq,channels,ctx_dim,heads){head_dim:=channels/heads scale:=1.0/sqrt(float(head_dim))ctx_seq:=seq if ctx_dim!=channels{ctx_seq=77}w_q,_:=st_tensor(prefix+".to_q.weight")w_k,_:=st_tensor(prefix+".to_k.weight")w_v,_:=st_tensor(prefix+".to_v.weight")w_out,_:=st_tensor(prefix+".to_out.0.weight")b_out,_:=st_tensor(prefix+".to_out.0.bias")q:=alloc(seq*channels*4)k:=alloc(ctx_seq*channels*4)v:=alloc(ctx_seq*channels*4)matmul_f32(q,hidden_states,w_q,0,channels,channels,seq)matmul_f32(k,context,w_k,0,ctx_dim,channels,ctx_seq)matmul_f32(v,context,w_v,0,ctx_dim,channels,ctx_seq)attn_out:=alloc(seq*channels*4)zero_buf(attn_out,seq*channels)scale:=1.0/sqrt(float(head_dim))attention_f32(q,k,v,attn_out,seq,ctx_seq,channels,heads,scale)matmul_f32(out,attn_out,w_out,b_out,channels,channels,seq)free(q)free(k)free(v)free(attn_out)}
+
+func transformer_block(out,hidden_states,context,prefix,seq,channels,ctx_seq,cross_dim,heads){ocl_sync()w_n1w,_:=st_tensor(prefix+".norm1.weight")w_n1b,_:=st_tensor(prefix+".norm1.bias")norm1_out:=alloc(seq*channels*4)if norm1_out==0{println(" alloc failed norm1")exit(1)}layer_norm_batch_f32(norm1_out,hidden_states,w_n1w,w_n1b,seq,channels)attn1_out:=alloc(seq*channels*4)if attn1_out==0{println(" alloc failed attn1")exit(1)}spatial_attention(attn1_out,norm1_out,norm1_out,prefix+".attn1",seq,channels,channels,heads)free(norm1_out)ocl_sync()h:=alloc(seq*channels*4)copy_buf(h,hidden_states,seq*channels)axpy_f32(h,1.0,attn1_out,seq*channels)free(attn1_out)w_n2w,_:=st_tensor(prefix+".norm2.weight")w_n2b,_:=st_tensor(prefix+".norm2.bias")norm2_out:=alloc(seq*channels*4)layer_norm_batch_f32(norm2_out,h,w_n2w,w_n2b,seq,channels)attn2_out:=alloc(seq*channels*4)spatial_attention(attn2_out,norm2_out,context,prefix+".attn2",seq,channels,cross_dim,heads)free(norm2_out)ocl_sync()axpy_f32(h,1.0,attn2_out,seq*channels)free(attn2_out)w_n3w,_:=st_tensor(prefix+".norm3.weight")w_n3b,_:=st_tensor(prefix+".norm3.bias")norm3_out:=alloc(seq*channels*4)layer_norm_batch_f32(norm3_out,h,w_n3w,w_n3b,seq,channels)w_ff1w,_:=st_tensor(prefix+".ff.net.0.proj.weight")w_ff1b,_:=st_tensor(prefix+".ff.net.0.proj.bias")w_ff2w,_:=st_tensor(prefix+".ff.net.2.weight")w_ff2b,_:=st_tensor(prefix+".ff.net.2.bias")ff1_shape:=st_shape(prefix+".ff.net.0.proj.weight")inner2:=ff1_shape[0]inner:=inner2/2 ff_hidden:=alloc(seq*inner2*4)ff_gated:=alloc(seq*inner*4)matmul_f32(ff_hidden,norm3_out,w_ff1w,w_ff1b,channels,inner2,seq)free(norm3_out)geglu_f32(ff_gated,ff_hidden,inner,seq)free(ff_hidden)matmul_f32(out,ff_gated,w_ff2w,w_ff2b,inner,channels,seq)free(ff_gated)ocl_sync()axpy_f32(out,1.0,h,seq*channels)free(h)}
+
+func attention_block(out,in_buf,context,prefix,channels,h,w_dim,ctx_seq,cross_dim,heads,n_transformers){seq:=h*w_dim ocl_sync()w_gn_w,_:=st_tensor(prefix+".norm.weight")w_gn_b,_:=st_tensor(prefix+".norm.bias")normed:=alloc(channels*h*w_dim*4)group_norm(normed,in_buf,w_gn_w,w_gn_b,channels,h,w_dim,32,0.00001)hs:=alloc(seq*channels*4)transpose_chw_f32(hs,normed,channels,h,w_dim)free(normed)w_pin_w,_:=st_tensor(prefix+".proj_in.weight")w_pin_b,_:=st_tensor(prefix+".proj_in.bias")proj_in_out:=alloc(seq*channels*4)matmul_f32(proj_in_out,hs,w_pin_w,w_pin_b,channels,channels,seq)free(hs)tb_out:=alloc(seq*channels*4)copy_buf(tb_out,proj_in_out,seq*channels)free(proj_in_out)ti:=0 while ti<n_transformers{tb_next:=alloc(seq*channels*4)transformer_block(tb_next,tb_out,context,prefix+".transformer_blocks."+str(ti),seq,channels,ctx_seq,cross_dim,heads)free(tb_out)tb_out=tb_next ti=ti+1}w_pout_w,_:=st_tensor(prefix+".proj_out.weight")w_pout_b,_:=st_tensor(prefix+".proj_out.bias")proj_out_out:=alloc(seq*channels*4)matmul_f32(proj_out_out,tb_out,w_pout_w,w_pout_b,channels,channels,seq)free(tb_out)transpose_add_chw_f32(out,in_buf,proj_out_out,channels,h,w_dim)free(proj_out_out)}
+
+func resnet_block_up(out,in_buf,prefix,ch,in_ch,h,w_dim,temb,temb_dim){ocl_sync()tmp:=alloc(in_ch*h*w_dim*4)w_n1w,_:=st_tensor(prefix+".norm1.weight")w_n1b,_:=st_tensor(prefix+".norm1.bias")group_norm_silu_f32(tmp,in_buf,w_n1w,w_n1b,in_ch,h,w_dim,32,0.00001)w_c1w,_:=st_tensor(prefix+".conv1.weight")w_c1b,_:=st_tensor(prefix+".conv1.bias")conv2d(out,tmp,w_c1w,w_c1b,in_ch,ch,h,w_dim,3,3,1,1)free(tmp)w_tepw,_:=st_tensor(prefix+".time_emb_proj.weight")w_tepb,_:=st_tensor(prefix+".time_emb_proj.bias")temb_proj:=alloc(ch*4)temb_silu:=alloc(temb_dim*4)copy_buf(temb_silu,temb,temb_dim)silu_buf(temb_silu,temb_dim)linear(temb_proj,w_tepw,w_tepb,temb_silu,temb_dim,ch)free(temb_silu)add_vec_spatial_f32(out,temb_proj,ch,h*w_dim)free(temb_proj)tmp2:=alloc(ch*h*w_dim*4)w_n2w,_:=st_tensor(prefix+".norm2.weight")w_n2b,_:=st_tensor(prefix+".norm2.bias")group_norm_silu_f32(tmp2,out,w_n2w,w_n2b,ch,h,w_dim,32,0.00001)w_c2w,_:=st_tensor(prefix+".conv2.weight")w_c2b,_:=st_tensor(prefix+".conv2.bias")conv2d(out,tmp2,w_c2w,w_c2b,ch,ch,h,w_dim,3,3,1,1)free(tmp2)if in_ch!=ch{w_sc_w,_:=st_tensor(prefix+".conv_shortcut.weight")w_sc_b,_:=st_tensor(prefix+".conv_shortcut.bias")shortcut:=alloc(ch*h*w_dim*4)conv2d(shortcut,in_buf,w_sc_w,w_sc_b,in_ch,ch,h,w_dim,1,1,0,1)axpy_f32(out,1.0,shortcut,ch*h*w_dim)free(shortcut)}else{axpy_f32(out,1.0,in_buf,ch*h*w_dim)}}
+
+var sdxl_unet_channels=[]int{320,640,1280}
+
+var sdxl_unet_heads=[]int{5,10,20}
+
+var sdxl_unet_transformers=[]int{1,2,10}
+
+var sdxl_unet_cross_dim=2048
+
+var sdxl_unet_sample_size=128
+
+var sdxl_unet_add_time_dim=256
+
+func sdxl_sinusoidal(timestep,dim)(emb){half:=dim/2 emb=alloc(dim*4)i:=0 while i<half{freq:=1.0/pow(10000.0,float(i)/float(half))arg:=float(timestep)*freq poke_f32(emb,i*4,cos(arg))poke_f32(emb,(i+half)*4,sin(arg))i=i+1}}
+
+func sdxl_unet_time_embedding(timestep)(temb){emb:=sdxl_sinusoidal(timestep,320)w_l1w,_:=st_tensor("time_embedding.linear_1.weight")w_l1b,_:=st_tensor("time_embedding.linear_1.bias")tmp:=alloc(1280*4)linear(tmp,w_l1w,w_l1b,emb,320,1280)silu_buf(tmp,1280)free(emb)w_l2w,_:=st_tensor("time_embedding.linear_2.weight")w_l2b,_:=st_tensor("time_embedding.linear_2.bias")temb=alloc(1280*4)linear(temb,w_l2w,w_l2b,tmp,1280,1280)free(tmp)}
+
+func sdxl_unet_add_embedding(pooled_text)(aug_emb){add_time_ids:=[]int{1024,1024,0,0,1024,1024}time_emb:=alloc(6*sdxl_unet_add_time_dim*4)i:=0 while i<6{se:=sdxl_sinusoidal(add_time_ids[i],sdxl_unet_add_time_dim)copy_buf(time_emb+i*sdxl_unet_add_time_dim*4,se,sdxl_unet_add_time_dim)free(se)i=i+1}concat:=alloc(2816*4)copy_buf(concat,pooled_text,1280)copy_buf(concat+1280*4,time_emb,1536)free(time_emb)w_l1w,_:=st_tensor("add_embedding.linear_1.weight")w_l1b,_:=st_tensor("add_embedding.linear_1.bias")tmp:=alloc(1280*4)linear(tmp,w_l1w,w_l1b,concat,2816,1280)free(concat)silu_buf(tmp,1280)w_l2w,_:=st_tensor("add_embedding.linear_2.weight")w_l2b,_:=st_tensor("add_embedding.linear_2.bias")aug_emb=alloc(1280*4)linear(aug_emb,w_l2w,w_l2b,tmp,1280,1280)free(tmp)}
+
+func unet_sdxl_forward(latent,context,pooled,timestep)(output){h:=sdxl_unet_sample_size w:=sdxl_unet_sample_size temb:=sdxl_unet_time_embedding(timestep)aug:=sdxl_unet_add_embedding(pooled)axpy_f32(temb,1.0,aug,1280)free(aug)w_cin_w,_:=st_tensor("conv_in.weight")w_cin_b,_:=st_tensor("conv_in.bias")x:=alloc(320*h*w*4)conv2d(x,latent,w_cin_w,w_cin_b,4,320,h,w,3,3,1,1)skips:=[]int{}ocl_sync()skip0:=alloc(320*h*w*4)copy_buf(skip0,x,320*h*w)skips=append(skips,skip0)db:=0 while db<3{ch:=sdxl_unet_channels[db]heads:=sdxl_unet_heads[db]n_tf:=sdxl_unet_transformers[db]has_attn:=db>0 l:=0 while l<2{res_out:=alloc(ch*h*w*4)if l==0&&db>0{prev_ch:=sdxl_unet_channels[db-1]resnet_block_ch(res_out,x,"down_blocks."+str(db)+".resnets."+str(l),prev_ch,ch,h,w,temb,1280)}else{resnet_block(res_out,x,"down_blocks."+str(db)+".resnets."+str(l),ch,h,w,temb,1280)}free(x)x=res_out if has_attn{att_out:=alloc(ch*h*w*4)attention_block(att_out,x,context,"down_blocks."+str(db)+".attentions."+str(l),ch,h,w,77,sdxl_unet_cross_dim,heads,n_tf)free(x)x=att_out}ocl_sync()skip_copy:=alloc(ch*h*w*4)copy_buf(skip_copy,x,ch*h*w)skips=append(skips,skip_copy)l=l+1}if db<2{w_ds_w,_:=st_tensor("down_blocks."+str(db)+".downsamplers.0.conv.weight")w_ds_b,_:=st_tensor("down_blocks."+str(db)+".downsamplers.0.conv.bias")ds_out:=alloc(ch*(h/2)*(w/2)*4)conv2d(ds_out,x,w_ds_w,w_ds_b,ch,ch,h,w,3,3,1,2)free(x)x=ds_out ocl_sync()skip_copy=alloc(ch*(h/2)*(w/2)*4)copy_buf(skip_copy,x,ch*(h/2)*(w/2))skips=append(skips,skip_copy)h=h/2 w=w/2}db=db+1}mid_res0:=alloc(1280*h*w*4)resnet_block(mid_res0,x,"mid_block.resnets.0",1280,h,w,temb,1280)free(x)x=mid_res0 mid_att:=alloc(1280*h*w*4)attention_block(mid_att,x,context,"mid_block.attentions.0",1280,h,w,77,sdxl_unet_cross_dim,20,10)free(x)x=mid_att mid_res1:=alloc(1280*h*w*4)resnet_block(mid_res1,x,"mid_block.resnets.1",1280,h,w,temb,1280)free(x)x=mid_res1 skip_idx:=len(skips)-1 ub:=0 while ub<3{db_match:=2-ub ch:=sdxl_unet_channels[db_match]heads:=sdxl_unet_heads[db_match]n_tf:=sdxl_unet_transformers[db_match]has_attn:=db_match>0 x_ch:=1280 if ub==1{x_ch=1280}if ub==2{x_ch=640}l:=0 while l<3{skip:=skips[skip_idx]skip_idx=skip_idx-1 conv1_shape:=st_shape("up_blocks."+str(ub)+".resnets."+str(l)+".conv1.weight")in_ch:=conv1_shape[1]skip_ch:=in_ch-x_ch ocl_sync()cat:=alloc(in_ch*h*w*4)concat_chw_f32(cat,x,skip,x_ch,skip_ch,h*w)free(skip)res_out:=alloc(ch*h*w*4)resnet_block_up(res_out,cat,"up_blocks."+str(ub)+".resnets."+str(l),ch,in_ch,h,w,temb,1280)free(cat)free(x)x=res_out x_ch=ch if has_attn{att_out:=alloc(ch*h*w*4)attention_block(att_out,x,context,"up_blocks."+str(ub)+".attentions."+str(l),ch,h,w,77,sdxl_unet_cross_dim,heads,n_tf)free(x)x=att_out}l=l+1}if ub<2{up_h:=h*2 up_w:=w*2 ocl_sync()upsampled:=alloc(ch*up_h*up_w*4)upsample_nearest(upsampled,x,ch,h,w)w_up_w,_:=st_tensor("up_blocks."+str(ub)+".upsamplers.0.conv.weight")w_up_b,_:=st_tensor("up_blocks."+str(ub)+".upsamplers.0.conv.bias")up_out:=alloc(ch*up_h*up_w*4)conv2d(up_out,upsampled,w_up_w,w_up_b,ch,ch,up_h,up_w,3,3,1,1)free(upsampled)free(x)x=up_out h=up_h w=up_w}ub=ub+1}w_cno_w,_:=st_tensor("conv_norm_out.weight")w_cno_b,_:=st_tensor("conv_norm_out.bias")normed:=alloc(320*h*w*4)group_norm_silu_f32(normed,x,w_cno_w,w_cno_b,320,h,w,32,0.00001)free(x)w_cout_w,_:=st_tensor("conv_out.weight")w_cout_b,_:=st_tensor("conv_out.bias")output=alloc(4*h*w*4)conv2d(output,normed,w_cout_w,w_cout_b,320,4,h,w,3,3,1,1)free(normed)ocl_sync()for _,s:=range skips{if skip_idx>=0&&s!=0{free(s)}}free(temb)}
+
+var vae_channels=[]int{512,512,256,128}
+
+func vae_attention(out,in_buf,prefix,channels,h,w_dim){seq:=h*w_dim ocl_sync()w_gn_w,_:=st_tensor(prefix+".group_norm.weight")w_gn_b,_:=st_tensor(prefix+".group_norm.bias")normed:=alloc(channels*h*w_dim*4)group_norm(normed,in_buf,w_gn_w,w_gn_b,channels,h,w_dim,32,0.000001)ocl_sync()hs:=alloc(seq*channels*4)y:=0 while y<h{x:=0 while x<w_dim{pos:=y*w_dim+x ci:=0 while ci<channels{poke_f32(hs,(pos*channels+ci)*4,peek_f32(normed,(ci*h*w_dim+y*w_dim+x)*4))ci=ci+1}x=x+1}y=y+1}free(normed)w_q,_:=st_tensor(prefix+".to_q.weight")b_q,_:=st_tensor(prefix+".to_q.bias")w_k,_:=st_tensor(prefix+".to_k.weight")b_k,_:=st_tensor(prefix+".to_k.bias")w_v,_:=st_tensor(prefix+".to_v.weight")b_v,_:=st_tensor(prefix+".to_v.bias")q:=alloc(seq*channels*4)k:=alloc(seq*channels*4)v:=alloc(seq*channels*4)matmul_f32(q,hs,w_q,b_q,channels,channels,seq)matmul_f32(k,hs,w_k,b_k,channels,channels,seq)matmul_f32(v,hs,w_v,b_v,channels,channels,seq)free(hs)scale:=1.0/sqrt(float(channels))attn_out:=alloc(seq*channels*4)scores:=alloc(seq*seq*4)matmul_f32(scores,q,k,0,channels,seq,seq)ocl_sync()i:=0 while i<seq{srow:=scores+i*seq*4 mx:=0.0-1e30 j:=0 while j<seq{s:=peek_f32(srow,j*4)*scale if s>mx{mx=s}j=j+1}sum:=0.0 j=0 while j<seq{e:=exp(peek_f32(srow,j*4)*scale-mx)poke_f32(srow,j*4,e)sum=sum+e j=j+1}inv_sum:=1.0/sum j=0 while j<seq{poke_f32(srow,j*4,peek_f32(srow,j*4)*inv_sum)j=j+1}i=i+1}ocl_sync()v_t:=alloc(channels*seq*4)i=0 while i<seq{j:=0 while j<channels{poke_f32(v_t,(j*seq+i)*4,peek_f32(v,(i*channels+j)*4))j=j+1}i=i+1}matmul_f32(attn_out,scores,v_t,0,seq,channels,seq)free(q)free(k)free(v)free(scores)free(v_t)w_out,_:=st_tensor(prefix+".to_out.0.weight")b_out,_:=st_tensor(prefix+".to_out.0.bias")proj_out:=alloc(seq*channels*4)matmul_f32(proj_out,attn_out,w_out,b_out,channels,channels,seq)free(attn_out)ocl_sync()y=0 while y<h{x=0 while x<w_dim{pos:=y*w_dim+x ci=0 while ci<channels{idx:=(ci*h*w_dim+y*w_dim+x)*4 poke_f32(out,idx,peek_f32(in_buf,idx)+peek_f32(proj_out,(pos*channels+ci)*4))ci=ci+1}x=x+1}y=y+1}free(proj_out)}
+
+func vae_resnet_block(out,in_buf,prefix,in_ch,out_ch,h,w_dim){ocl_sync()tmp:=alloc(in_ch*h*w_dim*4)w_n1w,_:=st_tensor(prefix+".norm1.weight")w_n1b,_:=st_tensor(prefix+".norm1.bias")group_norm_silu_f32(tmp,in_buf,w_n1w,w_n1b,in_ch,h,w_dim,32,0.000001)w_c1w,_:=st_tensor(prefix+".conv1.weight")w_c1b,_:=st_tensor(prefix+".conv1.bias")conv2d(out,tmp,w_c1w,w_c1b,in_ch,out_ch,h,w_dim,3,3,1,1)free(tmp)tmp2:=alloc(out_ch*h*w_dim*4)w_n2w,_:=st_tensor(prefix+".norm2.weight")w_n2b,_:=st_tensor(prefix+".norm2.bias")group_norm_silu_f32(tmp2,out,w_n2w,w_n2b,out_ch,h,w_dim,32,0.000001)w_c2w,_:=st_tensor(prefix+".conv2.weight")w_c2b,_:=st_tensor(prefix+".conv2.bias")conv2d(out,tmp2,w_c2w,w_c2b,out_ch,out_ch,h,w_dim,3,3,1,1)free(tmp2)if in_ch!=out_ch{w_sc_w,_:=st_tensor(prefix+".conv_shortcut.weight")w_sc_b,_:=st_tensor(prefix+".conv_shortcut.bias")shortcut:=alloc(out_ch*h*w_dim*4)conv2d(shortcut,in_buf,w_sc_w,w_sc_b,in_ch,out_ch,h,w_dim,1,1,0,1)axpy_f32(out,1.0,shortcut,out_ch*h*w_dim)free(shortcut)}else{axpy_f32(out,1.0,in_buf,out_ch*h*w_dim)}}
+
+func vae_decode_sdxl(latent)(image){h:=128 w:=128 vt0:=now_ms()w_pqc_w,_:=st_tensor("post_quant_conv.weight")w_pqc_b,_:=st_tensor("post_quant_conv.bias")x:=alloc(4*h*w*4)conv2d(x,latent,w_pqc_w,w_pqc_b,4,4,h,w,1,1,0,1)w_cin_w,_:=st_tensor("decoder.conv_in.weight")w_cin_b,_:=st_tensor("decoder.conv_in.bias")x2:=alloc(512*h*w*4)conv2d(x2,x,w_cin_w,w_cin_b,4,512,h,w,3,3,1,1)free(x)x=x2 mid0:=alloc(512*h*w*4)vae_resnet_block(mid0,x,"decoder.mid_block.resnets.0",512,512,h,w)free(x)x=mid0 mid_att:=alloc(512*h*w*4)vae_attention(mid_att,x,"decoder.mid_block.attentions.0",512,h,w)free(x)x=mid_att mid1:=alloc(512*h*w*4)vae_resnet_block(mid1,x,"decoder.mid_block.resnets.1",512,512,h,w)free(x)x=mid1 ub:=0 while ub<4{out_ch:=vae_channels[ub]in_ch:=0 if ub==0{in_ch=512}if ub==1{in_ch=512}if ub==2{in_ch=512}if ub==3{in_ch=256}l:=0 while l<3{r_in:=in_ch if l>0{r_in=out_ch}res_out:=alloc(out_ch*h*w*4)vae_resnet_block(res_out,x,"decoder.up_blocks."+str(ub)+".resnets."+str(l),r_in,out_ch,h,w)free(x)x=res_out l=l+1}if ub<3{up_h:=h*2 up_w:=w*2 ocl_sync()upsampled:=alloc(out_ch*up_h*up_w*4)upsample_nearest(upsampled,x,out_ch,h,w)w_up_w,_:=st_tensor("decoder.up_blocks."+str(ub)+".upsamplers.0.conv.weight")w_up_b,_:=st_tensor("decoder.up_blocks."+str(ub)+".upsamplers.0.conv.bias")up_out:=alloc(out_ch*up_h*up_w*4)conv2d(up_out,upsampled,w_up_w,w_up_b,out_ch,out_ch,up_h,up_w,3,3,1,1)free(upsampled)free(x)x=up_out h=up_h w=up_w}ub=ub+1}w_cno_w,_:=st_tensor("decoder.conv_norm_out.weight")w_cno_b,_:=st_tensor("decoder.conv_norm_out.bias")normed:=alloc(128*h*w*4)group_norm_silu_f32(normed,x,w_cno_w,w_cno_b,128,h,w,32,0.000001)free(x)w_cout_w,_:=st_tensor("decoder.conv_out.weight")w_cout_b,_:=st_tensor("decoder.conv_out.bias")image=alloc(3*h*w*4)conv2d(image,normed,w_cout_w,w_cout_b,128,3,h,w,3,3,1,1)free(normed)ocl_sync()println("  VAE: "+str(now_ms()-vt0)+"ms")flush()return}
+
+func vae_decode(latent)(image){h:=64 w:=64 vt0:=now_ms()w_pqc_w,_:=st_tensor("post_quant_conv.weight")w_pqc_b,_:=st_tensor("post_quant_conv.bias")x:=alloc(4*h*w*4)conv2d(x,latent,w_pqc_w,w_pqc_b,4,4,h,w,1,1,0,1)w_cin_w,_:=st_tensor("decoder.conv_in.weight")w_cin_b,_:=st_tensor("decoder.conv_in.bias")x2:=alloc(512*h*w*4)conv2d(x2,x,w_cin_w,w_cin_b,4,512,h,w,3,3,1,1)free(x)x=x2 vt_conv_in:=now_ms()-vt0 println("  vae conv_in: "+str(vt_conv_in)+"ms")flush()println("  vae mid_block...")flush()vt1:=now_ms()mid0:=alloc(512*h*w*4)vae_resnet_block(mid0,x,"decoder.mid_block.resnets.0",512,512,h,w)free(x)x=mid0 mid_att:=alloc(512*h*w*4)vae_attention(mid_att,x,"decoder.mid_block.attentions.0",512,h,w)free(x)x=mid_att mid1:=alloc(512*h*w*4)vae_resnet_block(mid1,x,"decoder.mid_block.resnets.1",512,512,h,w)free(x)x=mid1 vt_mid:=now_ms()-vt1 println("  vae mid_block done: "+str(vt_mid)+"ms")flush()vt2:=now_ms()ub:=0 while ub<4{println("  vae up_block "+str(ub)+" (h="+str(h)+")")flush()out_ch:=vae_channels[ub]in_ch:=0 if ub==0{in_ch=512}if ub==1{in_ch=512}if ub==2{in_ch=512}if ub==3{in_ch=256}l:=0 while l<3{r_in:=in_ch if l>0{r_in=out_ch}res_out:=alloc(out_ch*h*w*4)vae_resnet_block(res_out,x,"decoder.up_blocks."+str(ub)+".resnets."+str(l),r_in,out_ch,h,w)free(x)x=res_out l=l+1}if ub<3{up_h:=h*2 up_w:=w*2 ocl_sync()upsampled:=alloc(out_ch*up_h*up_w*4)upsample_nearest(upsampled,x,out_ch,h,w)w_up_w,_:=st_tensor("decoder.up_blocks."+str(ub)+".upsamplers.0.conv.weight")w_up_b,_:=st_tensor("decoder.up_blocks."+str(ub)+".upsamplers.0.conv.bias")up_out:=alloc(out_ch*up_h*up_w*4)conv2d(up_out,upsampled,w_up_w,w_up_b,out_ch,out_ch,up_h,up_w,3,3,1,1)free(upsampled)free(x)x=up_out h=up_h w=up_w}ub=ub+1}vt_up:=now_ms()-vt2 println("  vae up_blocks: "+str(vt_up)+"ms")flush()w_cno_w,_:=st_tensor("decoder.conv_norm_out.weight")w_cno_b,_:=st_tensor("decoder.conv_norm_out.bias")normed:=alloc(128*h*w*4)group_norm_silu_f32(normed,x,w_cno_w,w_cno_b,128,h,w,32,0.000001)free(x)w_cout_w,_:=st_tensor("decoder.conv_out.weight")w_cout_b,_:=st_tensor("decoder.conv_out.bias")image=alloc(3*h*w*4)conv2d(image,normed,w_cout_w,w_cout_b,128,3,h,w,3,3,1,1)free(normed)ocl_sync()vt_out:=now_ms()-vt0-vt_conv_in-vt_mid-vt_up println("  vae conv_out: "+str(vt_out)+"ms")flush()return}
+
+func write_ppm(path,image,h,w_dim){header:="P6\n"+str(w_dim)+" "+str(h)+"\n255\n" buf:=alloc(h*w_dim*3+100)hb:=bytes(header)pos:=0 i:=0 while i<len(hb){poke_u8(buf,pos,byte_at(hb,i))pos=pos+1 i=i+1}y:=0 while y<h{x:=0 while x<w_dim{c:=0 while c<3{val:=peek_f32(image,(c*h*w_dim+y*w_dim+x)*4)val=(val+1.0)*0.5 if val<0.0{val=0.0}if val>1.0{val=1.0}poke_u8(buf,pos,int(val*255.0))pos=pos+1 c=c+1}x=x+1}y=y+1}write_file_raw(path,buf,pos)free(buf)println("wrote "+str(w_dim)+"x"+str(h)+" PPM image to "+path)}
+
+var rng_state=12345
+
+func rng_next()(r){rng_state=rng_state^(rng_state<<13)rng_state=rng_state^(rng_state>>7)rng_state=rng_state^(rng_state<<17)r=rng_state return}
+
+func rand_normal()(r){u1:=float(rng_next()&0x7FFFFFFF)/float(0x7FFFFFFF)if u1<0.0001{u1=0.0001}u2:=float(rng_next()&0x7FFFFFFF)/float(0x7FFFFFFF)mag:=sqrt(0.0-2.0*log(u1))r=mag*cos(2.0*3.141592653589793*u2)return}
+
+func generate_noise(latent,n){i:=0 while i<n{poke_f32(latent,i*4,rand_normal())i=i+1}}
+
+func euler_step(sample,noise_pred,sigma,n){scale_factor:=0.18215 i:=0 while i<n{s:=peek_f32(sample,i*4)eps:=peek_f32(noise_pred,i*4)x0:=s-sigma*eps poke_f32(sample,i*4,x0/scale_factor)i=i+1}}
+
+var modelDir=""
+
+var debugDir=""
+
+func dump_raw(path,buf,n){if len(debugDir)==0{return}write_file_raw(path,buf,n*4)}
+
+func main(){argv:=args()if len(argv)<3{println("usage: machin-diffusion-sdxl <model_dir> <token_ids_file> [output.ppm] [debug_dir]")println("  model_dir contains text_encoder/, text_encoder_2/, unet_4step_fp32.safetensors, vae/")println("  token_ids_file: one int per line (use scripts/tokenize.py)")exit(1)}modelDir=argv[1]tokensPath:=argv[2]outPath:="output.ppm" if len(argv)>3{outPath=argv[3]}if len(argv)>4{debugDir=argv[4]}modelDir=replace(modelDir,"\\","/")println("machin-diffusion-sdxl — SDXL-Lightning 4-step in pure MFL")println("model: "+modelDir)flush()gpu:=ocl_init()if gpu==1{println("GPU: OpenCL initialized")}else{println("GPU: not available, using CPU")}flush()tokenText:=read_file(tokensPath)if len(tokenText)==0{println("cannot read "+tokensPath)exit(1)}tokenLines:=split(tokenText,"\n")token_ids:=[]int{}for _,line:=range tokenLines{if len(line)==0{continue}token_ids=append(token_ids,parse_int(line))}seq:=len(token_ids)if seq>sdxl_max_pos{seq=sdxl_max_pos}println("tokens: "+str(seq))println("=== Dual text encoder ===")flush()t0:=now_ms()context,pooled:=clip_sdxl_forward(token_ids,seq)t_clip:=now_ms()-t0 println("CLIP done: [77, 2048] + pooled [1280] ["+str(t_clip)+"ms]")flush()if len(debugDir)>0{dump_raw(debugDir+"/context.bin",context,sdxl_max_pos*2048)}println("=== Generating noise ===")latent_size:=4*128*128 latent:=alloc(latent_size*4)generate_noise(latent,latent_size)init_noise_sigma:=14.614641 i:=0 while i<latent_size{poke_f32(latent,i*4,peek_f32(latent,i*4)*init_noise_sigma)i=i+1}if len(debugDir)>0{dump_raw(debugDir+"/init_latent.bin",latent,latent_size)}sigmas:=[]float{14.614641,4.081729,1.612886,0.693205,0.0}timesteps:=[]int{999,749,499,249}println("=== UNet 4-step denoising ===")flush()t1:=now_ms()st_open(modelDir+"/unet_4step_fp32.safetensors")step:=0 while step<4{ts_step:=now_ms()sigma:=sigmas[step]sigma_next:=sigmas[step+1]timestep:=timesteps[step]scale_in:=1.0/sqrt(sigma*sigma+1.0)unet_input:=alloc(latent_size*4)i=0 while i<latent_size{poke_f32(unet_input,i*4,peek_f32(latent,i*4)*scale_in)i=i+1}noise_pred:=unet_sdxl_forward(unet_input,context,pooled,timestep)free(unet_input)if step==0&&len(debugDir)>0{dump_raw(debugDir+"/noise_pred_step0.bin",noise_pred,latent_size)}i=0 while i<latent_size{x:=peek_f32(latent,i*4)np:=peek_f32(noise_pred,i*4)denoised:=x-sigma*np poke_f32(latent,i*4,denoised+sigma_next*np)i=i+1}free(noise_pred)println("  step "+str(step+1)+"/4: "+str(now_ms()-ts_step)+"ms")flush()step=step+1}st_close()t_unet:=now_ms()-t1 println("UNet done ["+str(t_unet)+"ms]")flush()if len(debugDir)>0{dump_raw(debugDir+"/final_latent.bin",latent,latent_size)}println("=== VAE decode ===")flush()t2:=now_ms()vae_scale:=0.13025 i=0 while i<latent_size{poke_f32(latent,i*4,peek_f32(latent,i*4)/vae_scale)i=i+1}st_open(modelDir+"/vae/diffusion_pytorch_model.safetensors")image:=vae_decode_sdxl(latent)free(latent)if len(debugDir)>0{dump_raw(debugDir+"/vae_output.bin",image,3*1024*1024)}t_vae:=now_ms()-t2 println("VAE done ["+str(t_vae)+"ms]")flush()println("=== Writing image ===")flush()write_ppm(outPath,image,1024,1024)free(image)t_total:=t_clip+t_unet+t_vae println("=== Timing ===")println("CLIP: "+str(t_clip)+"ms")println("UNet: "+str(t_unet)+"ms (4 steps)")println("VAE:  "+str(t_vae)+"ms")println("Total: "+str(t_total)+"ms ("+str(t_total/1000)+"s)")flush()println("=== Complete! ===")println("Output: "+outPath)flush()}
+

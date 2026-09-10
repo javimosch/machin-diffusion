@@ -196,6 +196,78 @@ The pipeline is validated per-stage against a diffusers/PyTorch reference (`/tmp
 | final latent | 1.000000 | 0.000070 |
 | **image** | **pixel diff 0.05 mean** | **max=2** |
 
+## SDXL-Lightning port: in progress (causal attention fix validated)
+
+An SDXL-Lightning 4-step port was implemented (`clip_sdxl.src`, `unet_sdxl.src`, `main_sdxl.src`, `build_sdxl.sh`).
+The pipeline runs end-to-end on a RunPod RTX 4090 and produces 1024×1024 images in ~42s:
+
+| Stage | Time |
+|-------|------|
+| CLIP (dual text encoders: TE1 768d/12L + TE2 1280d/32L → 2048d context + 1280d pooled) | ~1s |
+| UNet (2.6B params, [1,2,10] transformer blocks, ADM text_time conditioning, 4 steps) | ~31s |
+| VAE (128×128 → 1024×1024, scale factor 0.13025) | ~11s |
+| **Total** | **~42s** |
+
+### Critical fix: causal attention (validated 2026-09-08)
+
+**Root cause of abstract noise output found:** CLIP text encoders require **causal**
+attention (position i only attends to positions j ≤ i), but the SDXL port was using
+**bidirectional** `attention_f32`. This produced TE2 hidden states with only 0.18
+correlation to the diffusers reference — enough to pass the pipeline but produce
+incoherent images.
+
+**Fix:** Added `attention_causal_f32` OpenCL kernel + CPU fallback to the machin compiler
+(`codegen.go`, `types.go`, `guide.go`). Changed `clip_sdxl.src` to use
+`attention_causal_f32` instead of `attention_f32`.
+
+**Validation (RunPod RTX 4090, diffusers 0.40.0 + transformers 4.48.3 + torch 2.5.1):**
+
+| Stage | Metric | Before fix | After fix |
+|-------|--------|------------|-----------|
+| TE2 hidden states [77×1280] | correlation | 0.181 | **0.9993** |
+| TE2 hidden states | mean_diff | 0.991 | **0.019** |
+| TE2 hidden states | ref mean/std | -0.173/1.064 | -0.173/1.064 |
+| TE2 hidden states | our mean/std | -0.162/0.985 | **-0.173/1.064** |
+| Scheduler sigmas | exact match | — | **[14.615, 4.082, 1.613, 0.693, 0.0]** ✓ |
+| Scheduler timesteps | exact match | — | **[999, 749, 499, 249]** ✓ |
+| VAE scaling factor | exact match | — | **0.13025** ✓ |
+
+The remaining max_diff of 1.36 in TE2 hidden is from float32 vs float64 accumulation
+differences in the online softmax — acceptable for image generation.
+
+### Remaining validation (pending pod restart)
+
+The following stages were not yet compared due to the RunPod pod being terminated
+(low account balance). All model files and reference outputs persist on the pod's
+network volume and will be available when the pod restarts:
+
+- UNet step-0 noise prediction vs diffusers
+- VAE decode output vs diffusers
+- Pooled output after text_projection vs diffusers
+- Visual image validation (generate and compare to reference.png)
+
+### Other bugs fixed in this session
+
+- **`text_projection` use-after-`st_close`**: In `clip_sdxl.src`, `sdxl_w_text_proj_w`
+  pointed into the safetensors mmap. The old code called `st_close()` before applying
+  the projection, leaving a dangling pointer. Fixed by applying `matmul_f32` for pooled
+  projection before `st_close()`.
+- **Wrong EOS position for pooled output**: The old code always used `eos_pos = seq - 1`
+  (the last padded token). Fixed by scanning token IDs for the highest ID (SDXL's EOS
+  token 49407) and using that position.
+
+### Known issues still pending
+
+- **CPU/GPU sync points** — the text encoder mixes CPU `layer_norm_batch`/`layer_norm` with GPU
+  `matmul_f32`/`attention_causal_f32`/`axpy_f32`, requiring manual `ocl_sync()` calls that are easy to
+  get wrong. A missed sync would silently produce garbage.
+- **ADM conditioning** — the `add_embedding` takes 6 `add_time_ids` (original size, crop coords,
+  target size) each sinusoidally embedded to 256d, concatenated with the 1280d pooled text to
+  2816d, then projected to 1280d. The `add_time_ids` values are hardcoded to `[1024,1024,0,0,1024,1024]`
+  and have not been verified against the diffusers reference.
+- **UNet/VAE not yet validated** — the causal attention fix addresses the text encoder, but
+  the UNet forward pass and VAE decode have not been numerically compared to the reference.
+
 ## Files
 
 | File | Role |
@@ -210,6 +282,10 @@ The pipeline is validated per-stage against a diffusers/PyTorch reference (`/tmp
 | `main.src` | CLI entry point + pipeline orchestration |
 | `scripts/extract_header.py` | Extract safetensors tensor index to `.idx` sidecar |
 | `scripts/tokenize.py` | CLIP BPE tokenizer (pre-processes prompt to token IDs) |
-| `build.sh` | Encode + build |
+| `build.sh` | Encode + build (SD-Turbo) |
+| `clip_sdxl.src` | SDXL dual text encoders (TE1 CLIP ViT-L/14 + TE2 OpenCLIP ViT-bigG) — causal attention validated |
+| `unet_sdxl.src` | SDXL UNet forward pass (2.6B params, [1,2,10] transformer blocks, ADM conditioning) — pending validation |
+| `main_sdxl.src` | SDXL-Lightning 4-step CLI entry point — pending validation |
+| `build_sdxl.sh` | Encode + build (SDXL-Lightning) |
 
 Part of [**awesome-machin**](https://github.com/javimosch/awesome-machin).

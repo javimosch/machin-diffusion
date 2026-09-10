@@ -109,7 +109,7 @@ func unet_forward(latent, clip_emb, timestep) (output) {
             // Attention (if present)
             if has_attn {
                 att_out := alloc(ch * h * w * 4)
-                attention_block(att_out, x, clip_emb, "down_blocks." + str(db) + ".attentions." + str(l), ch, h, w, 77, unet_cross_dim, heads)
+                attention_block(att_out, x, clip_emb, "down_blocks." + str(db) + ".attentions." + str(l), ch, h, w, 77, unet_cross_dim, heads, 1)
                 free(x)
                 x = att_out
             }
@@ -152,7 +152,7 @@ func unet_forward(latent, clip_emb, timestep) (output) {
     x = mid_res0
 
     mid_att := alloc(1280 * h * w * 4)
-    attention_block(mid_att, x, clip_emb, "mid_block.attentions.0", 1280, h, w, 77, unet_cross_dim, 20)
+    attention_block(mid_att, x, clip_emb, "mid_block.attentions.0", 1280, h, w, 77, unet_cross_dim, 20, 1)
     free(x)
     x = mid_att
 
@@ -216,7 +216,7 @@ func unet_forward(latent, clip_emb, timestep) (output) {
             // Attention (if present)
             if has_attn {
                 att_out := alloc(ch * h * w * 4)
-                attention_block(att_out, x, clip_emb, "up_blocks." + str(ub) + ".attentions." + str(l), ch, h, w, 77, unet_cross_dim, heads)
+                attention_block(att_out, x, clip_emb, "up_blocks." + str(ub) + ".attentions." + str(l), ch, h, w, 77, unet_cross_dim, heads, 1)
                 free(x)
                 x = att_out
             }
@@ -269,62 +269,4 @@ func unet_forward(latent, clip_emb, timestep) (output) {
     }
     free(temb)
     return
-}
-
-// ResNet block for up blocks (input channels may differ from output channels)
-// The first conv1 takes in_ch → ch, second conv2 takes ch → ch
-func resnet_block_up(out, in_buf, prefix, ch, in_ch, h, w_dim, temb, temb_dim) {
-    // Ensure in_buf is on host (needed for residual axpy later)
-    ocl_sync()
-    // norm1 operates over in_ch channels, so tmp must hold in_ch channels
-    tmp := alloc(in_ch * h * w_dim * 4)
-
-    // norm1 + SiLU (fused GPU kernel)
-    w_n1w, _ := st_tensor(prefix + ".norm1.weight")
-    w_n1b, _ := st_tensor(prefix + ".norm1.bias")
-    group_norm_silu_f32(tmp, in_buf, w_n1w, w_n1b, in_ch, h, w_dim, 32, 0.00001)
-
-    // conv1: in_ch → ch (3×3, pad=1)
-    w_c1w, _ := st_tensor(prefix + ".conv1.weight")
-    w_c1b, _ := st_tensor(prefix + ".conv1.bias")
-    conv2d(out, tmp, w_c1w, w_c1b, in_ch, ch, h, w_dim, 3, 3, 1, 1)
-    free(tmp)
-
-    // Time embedding projection
-    w_tepw, _ := st_tensor(prefix + ".time_emb_proj.weight")
-    w_tepb, _ := st_tensor(prefix + ".time_emb_proj.bias")
-    temb_proj := alloc(ch * 4)
-    temb_silu := alloc(temb_dim * 4)
-    copy_buf(temb_silu, temb, temb_dim)
-    silu_buf(temb_silu, temb_dim)
-    linear(temb_proj, w_tepw, w_tepb, temb_silu, temb_dim, ch)
-    free(temb_silu)
-
-    // Add temb_proj to each spatial position (GPU broadcast add)
-    add_vec_spatial_f32(out, temb_proj, ch, h * w_dim)
-    free(temb_proj)
-
-    // norm2 + SiLU (fused GPU kernel)
-    tmp2 := alloc(ch * h * w_dim * 4)
-    w_n2w, _ := st_tensor(prefix + ".norm2.weight")
-    w_n2b, _ := st_tensor(prefix + ".norm2.bias")
-    group_norm_silu_f32(tmp2, out, w_n2w, w_n2b, ch, h, w_dim, 32, 0.00001)
-
-    // conv2: ch → ch
-    w_c2w, _ := st_tensor(prefix + ".conv2.weight")
-    w_c2b, _ := st_tensor(prefix + ".conv2.bias")
-    conv2d(out, tmp2, w_c2w, w_c2b, ch, ch, h, w_dim, 3, 3, 1, 1)
-    free(tmp2)
-
-    // Residual: need conv_shortcut if in_ch != ch — use axpy_f32 (vectorized)
-    if in_ch != ch {
-        w_sc_w, _ := st_tensor(prefix + ".conv_shortcut.weight")
-        w_sc_b, _ := st_tensor(prefix + ".conv_shortcut.bias")
-        shortcut := alloc(ch * h * w_dim * 4)
-        conv2d(shortcut, in_buf, w_sc_w, w_sc_b, in_ch, ch, h, w_dim, 1, 1, 0, 1)
-        axpy_f32(out, 1.0, shortcut, ch * h * w_dim)
-        free(shortcut)
-    } else {
-        axpy_f32(out, 1.0, in_buf, ch * h * w_dim)
-    }
 }

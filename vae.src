@@ -186,6 +186,98 @@ func vae_resnet_block(out, in_buf, prefix, in_ch, out_ch, h, w_dim) {
     }
 }
 
+// VAE decoder for SDXL (latent 128x128 → image 1024x1024)
+func vae_decode_sdxl(latent) (image) {
+    h := 128
+    w := 128
+    vt0 := now_ms()
+
+    w_pqc_w, _ := st_tensor("post_quant_conv.weight")
+    w_pqc_b, _ := st_tensor("post_quant_conv.bias")
+    x := alloc(4 * h * w * 4)
+    conv2d(x, latent, w_pqc_w, w_pqc_b, 4, 4, h, w, 1, 1, 0, 1)
+
+    w_cin_w, _ := st_tensor("decoder.conv_in.weight")
+    w_cin_b, _ := st_tensor("decoder.conv_in.bias")
+    x2 := alloc(512 * h * w * 4)
+    conv2d(x2, x, w_cin_w, w_cin_b, 4, 512, h, w, 3, 3, 1, 1)
+    free(x)
+    x = x2
+
+    // mid_block
+    mid0 := alloc(512 * h * w * 4)
+    vae_resnet_block(mid0, x, "decoder.mid_block.resnets.0", 512, 512, h, w)
+    free(x)
+    x = mid0
+
+    mid_att := alloc(512 * h * w * 4)
+    vae_attention(mid_att, x, "decoder.mid_block.attentions.0", 512, h, w)
+    free(x)
+    x = mid_att
+
+    mid1 := alloc(512 * h * w * 4)
+    vae_resnet_block(mid1, x, "decoder.mid_block.resnets.1", 512, 512, h, w)
+    free(x)
+    x = mid1
+
+    // up_blocks
+    ub := 0
+    while ub < 4 {
+        out_ch := vae_channels[ub]
+        in_ch := 0
+        if ub == 0 { in_ch = 512 }
+        if ub == 1 { in_ch = 512 }
+        if ub == 2 { in_ch = 512 }
+        if ub == 3 { in_ch = 256 }
+
+        l := 0
+        while l < 3 {
+            r_in := in_ch
+            if l > 0 { r_in = out_ch }
+            res_out := alloc(out_ch * h * w * 4)
+            vae_resnet_block(res_out, x, "decoder.up_blocks." + str(ub) + ".resnets." + str(l), r_in, out_ch, h, w)
+            free(x)
+            x = res_out
+            l = l + 1
+        }
+
+        if ub < 3 {
+            up_h := h * 2
+            up_w := w * 2
+            ocl_sync()
+            upsampled := alloc(out_ch * up_h * up_w * 4)
+            upsample_nearest(upsampled, x, out_ch, h, w)
+            w_up_w, _ := st_tensor("decoder.up_blocks." + str(ub) + ".upsamplers.0.conv.weight")
+            w_up_b, _ := st_tensor("decoder.up_blocks." + str(ub) + ".upsamplers.0.conv.bias")
+            up_out := alloc(out_ch * up_h * up_w * 4)
+            conv2d(up_out, upsampled, w_up_w, w_up_b, out_ch, out_ch, up_h, up_w, 3, 3, 1, 1)
+            free(upsampled)
+            free(x)
+            x = up_out
+            h = up_h
+            w = up_w
+        }
+        ub = ub + 1
+    }
+
+    // conv_norm_out + conv_out
+    w_cno_w, _ := st_tensor("decoder.conv_norm_out.weight")
+    w_cno_b, _ := st_tensor("decoder.conv_norm_out.bias")
+    normed := alloc(128 * h * w * 4)
+    group_norm_silu_f32(normed, x, w_cno_w, w_cno_b, 128, h, w, 32, 0.000001)
+    free(x)
+
+    w_cout_w, _ := st_tensor("decoder.conv_out.weight")
+    w_cout_b, _ := st_tensor("decoder.conv_out.bias")
+    image = alloc(3 * h * w * 4)
+    conv2d(image, normed, w_cout_w, w_cout_b, 128, 3, h, w, 3, 3, 1, 1)
+    free(normed)
+    ocl_sync()
+    println("  VAE: " + str(now_ms() - vt0) + "ms")
+    flush()
+    return
+}
+
 // VAE decoder forward pass
 // latent: [4, 64, 64] → image: [3, 512, 512]
 func vae_decode(latent) (image) {
